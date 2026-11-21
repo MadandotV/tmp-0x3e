@@ -1,7 +1,14 @@
 
 use std::fs::File;
-use std::io::Write;
 use std::path::Path;
+
+#[derive(Clone, Copy, Default, PartialEq)]
+pub enum Mode {
+    #[default]
+    Plain,
+    Bytes,
+    Runs,
+}
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Kind {
@@ -19,7 +26,10 @@ pub struct Spec {
 
 #[derive(Default)]
 pub struct Column {
+    pub mode: Mode,
     pub values: Vec<u8>,
+    pub dictionary: Vec<u8>,
+    pub dictionary_len: usize,
     pub present: Vec<u8>,
 }
 
@@ -36,6 +46,17 @@ impl Column {
     #[inline]
     pub fn push_i32(&mut self, value: i32) {
         self.values.extend_from_slice(&value.to_le_bytes());
+    }
+    #[inline]
+    pub fn push_run(&mut self, len: usize, index: usize) {
+        debug_assert!(index < 1 << 24);
+        let mut header = (len as u64) << 1;
+        while header >= 0x80 {
+            self.values.push(header as u8 | 0x80);
+            header >>= 7;
+        }
+        self.values.push(header as u8);
+        self.values.extend_from_slice(&(index as u32).to_le_bytes()[..3]);
     }
     #[inline]
     pub fn push_present(&mut self, row: usize, present: bool) {
@@ -130,15 +151,60 @@ fn physical(kind: Kind) -> i32 {
     }
 }
 
+fn write_parts(file: &File, parts: &[&[u8]]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut vectors: Vec<libc::iovec> = parts
+        .iter()
+        .filter(|part| !part.is_empty())
+        .map(|part| libc::iovec { iov_base: part.as_ptr() as *mut libc::c_void, iov_len: part.len() })
+        .collect();
+    let mut from = 0;
+    while from < vectors.len() {
+        let count = (vectors.len() - from).min(1024) as libc::c_int;
+        let wrote = unsafe { libc::writev(file.as_raw_fd(), vectors.as_ptr().add(from), count) };
+        if wrote < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        let mut wrote = wrote as usize;
+        while from < vectors.len() && wrote >= vectors[from].iov_len {
+            wrote -= vectors[from].iov_len;
+            from += 1;
+        }
+        if wrote > 0 {
+            vectors[from].iov_base = unsafe { (vectors[from].iov_base as *mut u8).add(wrote) } as *mut libc::c_void;
+            vectors[from].iov_len -= wrote;
+        }
+    }
+    Ok(())
+}
+
 pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> std::io::Result<()> {
-    let mut file = File::create(path)?;
+    let file = File::create(path)?;
     let mut offset: u64 = 4;
-    let mut head = Vec::with_capacity(4096);
-    head.extend_from_slice(b"PAR1");
-    let mut chunks: Vec<(u64, u64)> = Vec::new();
-    let mut pending: Vec<u8> = head;
+    let mut chunks: Vec<(Option<u64>, u64, u64)> = Vec::new();
+    let mut heads: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    const PADDING: [u8; 8] = [0; 8];
     if rows > 0 {
         for (spec, column) in specs.iter().zip(columns) {
+            let mut dictionary = Vec::new();
+            if column.mode != Mode::Plain {
+                let size = column.dictionary.len();
+                assert!(size < i32::MAX as usize, "page too large");
+                let mut header = Thrift::new();
+                header.i32(1, 2); // DICTIONARY_PAGE
+                header.i32(2, size as i32);
+                header.i32(3, size as i32);
+                header.open(7);
+                header.i32(1, column.dictionary_len as i32);
+                header.i32(2, 0); // PLAIN
+                header.close();
+                header.out.push(0);
+                dictionary = header.out;
+            }
             let mut levels = Vec::new();
             if spec.optional {
                 let groups = rows.div_ceil(8);
@@ -148,7 +214,20 @@ pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> st
                 levels.extend_from_slice(&run.out);
                 levels.extend_from_slice(&column.present[..groups]);
             }
-            let size = levels.len() + column.values.len();
+            let mut padding = 0;
+            match column.mode {
+                Mode::Plain => {}
+                Mode::Bytes => {
+                    let groups = column.values.len().div_ceil(8);
+                    padding = groups * 8 - column.values.len();
+                    let mut run = Thrift::new();
+                    run.varint((groups as u64) << 1 | 1);
+                    levels.push(8);
+                    levels.extend_from_slice(&run.out);
+                }
+                Mode::Runs => levels.push(24),
+            }
+            let size = levels.len() + column.values.len() + padding;
             assert!(size < i32::MAX as usize, "page too large");
             let mut header = Thrift::new();
             header.i32(1, 0); // DATA_PAGE
@@ -156,23 +235,17 @@ pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> st
             header.i32(3, size as i32);
             header.open(5);
             header.i32(1, rows as i32);
-            header.i32(2, 0); // PLAIN
+            header.i32(2, if column.mode == Mode::Plain { 0 } else { 8 }); // PLAIN or RLE_DICTIONARY
             header.i32(3, 3); // RLE
             header.i32(4, 3); // RLE
             header.close();
             header.out.push(0);
-            pending.extend_from_slice(&header.out);
-            pending.extend_from_slice(&levels);
-            let total = (header.out.len() + size) as u64;
-            chunks.push((offset, total));
+            let before = (dictionary.len() + if column.mode == Mode::Plain { 0 } else { column.dictionary.len() }) as u64;
+            let total = before + (header.out.len() + size) as u64;
+            chunks.push(((column.mode != Mode::Plain).then_some(offset), offset + before, total));
             offset += total;
-            if column.values.len() >= 1 << 16 {
-                file.write_all(&pending)?;
-                pending.clear();
-                file.write_all(&column.values)?;
-            } else {
-                pending.extend_from_slice(&column.values);
-            }
+            header.out.extend_from_slice(&levels);
+            heads.push((dictionary, header.out));
         }
     }
 
@@ -212,14 +285,17 @@ pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> st
         meta.list(4, T_STRUCT, 1);
         meta.open_element();
         meta.list(1, T_STRUCT, specs.len());
-        for (spec, &(at, total)) in specs.iter().zip(&chunks) {
+        for (spec, &(dictionary, at, total)) in specs.iter().zip(&chunks) {
             meta.open_element();
-            meta.i64(2, at as i64);
+            meta.i64(2, dictionary.unwrap_or(at) as i64);
             meta.open(3);
             meta.i32(1, physical(spec.kind));
-            meta.list(2, T_I32, 2);
+            meta.list(2, T_I32, if dictionary.is_some() { 3 } else { 2 });
             meta.zigzag(0); // PLAIN
             meta.zigzag(3); // RLE
+            if dictionary.is_some() {
+                meta.zigzag(8); // RLE_DICTIONARY
+            }
             meta.list(3, T_BINARY, 1);
             meta.varint(spec.name.len() as u64);
             meta.out.extend_from_slice(spec.name.as_bytes());
@@ -228,6 +304,9 @@ pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> st
             meta.i64(6, total as i64);
             meta.i64(7, total as i64);
             meta.i64(9, at as i64);
+            if let Some(dictionary) = dictionary {
+                meta.i64(11, dictionary as i64);
+            }
             meta.close();
             meta.close();
         }
@@ -239,10 +318,21 @@ pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> st
     }
     meta.binary(6, b"nb7x");
     meta.out.push(0);
-    pending.extend_from_slice(&meta.out);
-    pending.extend_from_slice(&(meta.out.len() as u32).to_le_bytes());
-    pending.extend_from_slice(b"PAR1");
-    file.write_all(&pending)
+    let length = (meta.out.len() as u32).to_le_bytes();
+    let mut parts: Vec<&[u8]> = vec![b"PAR1"];
+    for (column, (dictionary, head)) in columns.iter().zip(&heads) {
+        if column.mode != Mode::Plain {
+            parts.push(dictionary);
+            parts.push(&column.dictionary);
+        }
+        parts.push(head);
+        parts.push(&column.values);
+        if column.mode == Mode::Bytes {
+            parts.push(&PADDING[..column.values.len().div_ceil(8) * 8 - column.values.len()]);
+        }
+    }
+    parts.extend_from_slice(&[&meta.out, &length, b"PAR1"]);
+    write_parts(&file, &parts)
 }
 
 pub const T_ONE: [Spec; 6] = [
