@@ -2,8 +2,12 @@
 use std::arch::x86_64::*;
 
 use super::super::DAY;
-use super::codec::{unscramble, A_INVERSE, B_INVERSE, MASK};
-use super::{Rec, BUCKET, BUCKET_BITS, INGEST_BITS, INVALID};
+#[cfg(test)]
+use super::codec::unscramble;
+use super::codec::{A_INVERSE, B_INVERSE, MASK};
+#[cfg(test)]
+use super::BUCKET;
+use super::{Rec, BUCKET_BITS, INGEST_BITS, INVALID};
 
 pub struct Frame {
     pub user_key: u64,
@@ -17,7 +21,7 @@ pub struct Frame {
 }
 
 impl Frame {
-    #[inline(always)]
+    #[cfg(test)]
     pub fn one(&self, event: u64, who: u64, ts: i64, ingest: i64, payload: Option<u32>) -> Option<(usize, Rec)> {
         let seconds = ingest.wrapping_sub(self.ingest_start) as u64;
         let valid = payload.is_some() && ts >= self.window_start && ts < self.window_end && ingest.wrapping_mul(1000).wrapping_sub(ts) <= DAY;
@@ -35,13 +39,12 @@ impl Frame {
     }
 
     #[inline(always)]
-    pub unsafe fn four(&self, ids: *const [u64; 2], times: *const [i64; 2], marks: *const u64, records: *mut Rec, buckets: *mut u64) -> u32 {
+    pub unsafe fn four(&self, ids: *const [u64; 2], times: *const [i64; 2], records: *mut Rec, buckets: *mut u64) -> u32 {
         let all = |value: u64| _mm256_set1_epi64x(value as i64);
         let (first, second) = (_mm256_loadu_si256(ids as *const __m256i), _mm256_loadu_si256(ids.add(2) as *const __m256i));
         let (events, users) = (_mm256_unpacklo_epi64(first, second), _mm256_unpackhi_epi64(first, second));
         let (first, second) = (_mm256_loadu_si256(times as *const __m256i), _mm256_loadu_si256(times.add(2) as *const __m256i));
         let (ts, ingest) = (_mm256_unpacklo_epi64(first, second), _mm256_unpackhi_epi64(first, second));
-        let marks = _mm256_permute4x64_epi64::<0b1101_1000>(_mm256_loadu_si256(marks as *const __m256i));
 
         let times_low = |value: __m256i, by: u64| {
             let cross = _mm256_add_epi64(_mm256_mul_epu32(value, all(by >> 32)), _mm256_mul_epu32(_mm256_srli_epi64::<32>(value), all(by & 0xFFFF_FFFF)));
@@ -65,7 +68,7 @@ impl Frame {
         let valid = _mm256_andnot_si256(_mm256_cmpgt_epi64(apart, _mm256_set1_epi64x(DAY)), below(stamp, self.window_end.wrapping_sub(self.window_start)));
         let fits = _mm256_and_si256(below(seconds, (1 << INGEST_BITS) - 1), _mm256_cmpgt_epi64(all(self.event_bound), index));
         let foreign = _mm256_andnot_si256(_mm256_cmpgt_epi64(all(self.user_bound), dense), valid);
-        let left = _mm256_or_si256(_mm256_or_si256(_mm256_andnot_si256(fits, all(u64::MAX)), foreign), marks);
+        let left = _mm256_or_si256(_mm256_andnot_si256(fits, all(u64::MAX)), foreign);
 
         let stamp = _mm256_blendv_epi8(all(INVALID << 32), _mm256_slli_epi64::<32>(stamp), valid);
         let a = _mm256_or_si256(_mm256_or_si256(_mm256_and_si256(dense, valid), stamp), _mm256_and_si256(_mm256_slli_epi64::<49>(index), all(1 << 63)));
@@ -75,5 +78,18 @@ impl Frame {
         let bucket = _mm256_blendv_pd(_mm256_castsi256_pd(_mm256_srli_epi64::<{ BUCKET_BITS as i32 }>(index)), _mm256_castsi256_pd(all(self.spare)), _mm256_castsi256_pd(left));
         _mm256_storeu_pd(buckets as *mut f64, _mm256_permute4x64_pd::<0b1101_1000>(bucket));
         _mm256_movemask_pd(_mm256_permute4x64_pd::<0b1101_1000>(_mm256_castsi256_pd(left))) as u32
+    }
+}
+
+#[inline(always)]
+pub fn stands(record: &Rec) -> bool {
+    record.a >> 32 & INVALID != INVALID
+}
+
+#[inline(always)]
+pub fn pay(record: &mut Rec, payload: Option<u32>) {
+    match payload {
+        Some(payload) => record.b |= u64::from(payload),
+        None => record.a = record.a & 1 << 63 | INVALID << 32,
     }
 }

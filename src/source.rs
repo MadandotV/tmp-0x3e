@@ -18,7 +18,7 @@ pub fn chunk() -> usize {
     static CHUNK: OnceLock<usize> = OnceLock::new();
     *CHUNK.get_or_init(|| {
         let asked = std::env::var("NB7X_CHUNK_KB").ok().and_then(|value| value.parse::<usize>().ok());
-        asked.map_or(if mapped() { 2 << 20 } else { 1 << 18 }, |kb| kb.max(64) << 10)
+        asked.map_or(if mapped() { 4 << 20 } else { 1 << 18 }, |kb| kb.max(64) << 10)
     })
 }
 
@@ -34,13 +34,14 @@ pub fn open(path: &Path) -> Source {
         return Source { file: Some(file), len, map: std::ptr::null_mut() };
     }
     unsafe {
-        let room = len.next_multiple_of(PAGE) + 2 * PAGE;
+        const HUGE: usize = 2 << 20;
+        let room = len.next_multiple_of(PAGE) + 2 * PAGE + HUGE;
         let protection = libc::PROT_READ | libc::PROT_WRITE;
         let whole = libc::mmap(std::ptr::null_mut(), room, protection, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
         if whole == libc::MAP_FAILED {
             return Source { file: Some(file), len, map: std::ptr::null_mut() };
         }
-        let at = (whole as *mut u8).add(PAGE) as *mut libc::c_void;
+        let at = (whole as usize + PAGE).next_multiple_of(HUGE) as *mut libc::c_void;
         if libc::mmap(at, len, protection, libc::MAP_PRIVATE | libc::MAP_FIXED, file.as_raw_fd(), 0) == libc::MAP_FAILED {
             libc::munmap(whole, room);
             return Source { file: Some(file), len, map: std::ptr::null_mut() };

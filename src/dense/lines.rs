@@ -28,6 +28,7 @@ pub fn tasks(inputs: &[Input], chunk: usize) -> Vec<Task> {
 }
 
 const OVERHANG: usize = 4096;
+const AHEAD: usize = 256;
 const PAD: usize = 256;
 const LEAD: usize = 64;
 
@@ -269,6 +270,7 @@ pub unsafe fn run_clicks(input: &Input, task: Task, buffer: &mut Buffer, batch: 
     let mut row = first;
     let (mut at, end) = (base.add(from), base.add(to));
     while at < end {
+        _mm_prefetch::<_MM_HINT_T0>(at.add(AHEAD) as *const i8);
         let len = rows::read_click(at, days, row);
         if len != 0 {
             at = at.add(len);
@@ -317,6 +319,7 @@ pub unsafe fn run_events(input: &Input, task: Task, buffer: &mut Buffer, batch: 
     let mut row = 0;
     let (mut at, end) = (base.add(from), base.add(to));
     while at < end {
+        _mm_prefetch::<_MM_HINT_T0>(at.add(AHEAD) as *const i8);
         let len = rows::read(at, days, rows, row);
         if len != 0 {
             at = at.add(len);

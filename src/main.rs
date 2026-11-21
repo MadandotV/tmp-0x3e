@@ -1233,7 +1233,18 @@ fn main() {
         libc::mallopt(libc::M_ARENA_MAX, 1);
         libc::mallopt(libc::M_TOP_PAD, 64 << 20);
         libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 30);
-        libc::mallopt(libc::M_TRIM_THRESHOLD, 1 << 30);
+        libc::mallopt(libc::M_TRIM_THRESHOLD, i32::MAX);
+    }
+    if mem::huge_pages() == mem::Huge::OnRequest && std::env::var_os("NB7X_PLAIN_HEAP").is_none() {
+        const AHEAD: usize = 1 << 30;
+        unsafe {
+            let block = libc::malloc(AHEAD - (1 << 20));
+            if !block.is_null() {
+                let from = (block as usize).next_multiple_of(2 << 20);
+                libc::madvise(from as *mut libc::c_void, block as usize + AHEAD - (4 << 20) - from, libc::MADV_HUGEPAGE);
+                libc::free(block);
+            }
+        }
     }
     let arguments: Vec<String> = std::env::args().collect();
     let pick = |at: usize, name: &str, default: &str| {
@@ -1272,6 +1283,10 @@ fn main() {
     }
     pool::start(threads);
     if dense::run(&data, &output, threads, verbose, started) {
+        if std::env::var_os("NB7X_RELEASE").is_some() {
+            mem::release_all();
+            lap("released");
+        }
         unsafe { libc::_exit(0) };
     }
     pool::unpin();

@@ -333,7 +333,41 @@ pub fn write(path: &Path, specs: &[Spec], columns: &[Column], rows: usize) -> st
         }
     }
     parts.extend_from_slice(&[&meta.out, &length, b"PAR1"]);
-    write_parts(&file, &parts)
+    write_parts(&file, &parts)?;
+    write_out(file);
+    Ok(())
+}
+
+fn write_out(file: File) {
+    use std::sync::{Condvar, Mutex, OnceLock};
+    struct Queue {
+        files: Mutex<Vec<File>>,
+        more: Condvar,
+    }
+    static QUEUE: OnceLock<Option<&'static Queue>> = OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        if std::env::var_os("NB7X_NO_KICK").is_some() {
+            return None;
+        }
+        let queue: &'static Queue = Box::leak(Box::new(Queue { files: Mutex::new(Vec::new()), more: Condvar::new() }));
+        let spawned = std::thread::Builder::new().spawn(move || loop {
+            let mut files = queue.files.lock().unwrap();
+            while files.is_empty() {
+                files = queue.more.wait(files).unwrap();
+            }
+            let batch = std::mem::take(&mut *files);
+            drop(files);
+            for file in batch {
+                use std::os::fd::AsRawFd;
+                unsafe { libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) };
+            }
+        });
+        spawned.is_ok().then_some(queue)
+    });
+    if let Some(queue) = queue {
+        queue.files.lock().unwrap().push(file);
+        queue.more.notify_one();
+    }
 }
 
 pub const T_ONE: [Spec; 6] = [

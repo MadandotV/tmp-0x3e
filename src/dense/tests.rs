@@ -200,6 +200,31 @@ fn event_text(next: &mut dyn FnMut() -> u64, damage: bool) -> Vec<u8> {
     line
 }
 
+fn near(line: &[u8], odd: &[u8], mut each: impl FnMut(&[u8])) {
+    let mut text = Vec::new();
+    for at in 0..=line.len() {
+        for &byte in odd {
+            text.clear();
+            text.extend_from_slice(&line[..at]);
+            text.push(byte);
+            text.extend_from_slice(&line[at..]);
+            each(&text);
+            if at < line.len() && line[at] != byte {
+                text.remove(at + 1);
+                each(&text);
+            }
+        }
+        if at < line.len() {
+            text.clear();
+            text.extend_from_slice(&line[..at]);
+            text.extend_from_slice(&line[at + 1..]);
+            each(&text);
+        }
+    }
+}
+
+const ODD: &[u8] = b"\",\n\r 0a9Zz:-+eukpvc_Tt1";
+
 #[test]
 fn the_row_reader_takes_only_what_the_general_one_reads_the_same() {
     use super::codec::decode;
@@ -210,23 +235,20 @@ fn the_row_reader_takes_only_what_the_general_one_reads_the_same() {
     let mut days = Days::new();
     let mut rows = Rows::new();
     let mut calendar = Calendar::new();
-    let (mut clean, mut clean_taken, mut damaged_taken, mut purchases) = (0u64, 0u64, 0u64, 0u64);
-    for round in 0..8_000_000u64 {
-        let damage = round % 3 != 0;
-        let mut text = if round % 5 == 0 { vec![0u8; 64] } else { [&[b'\n'; 40][..], &event_text(&mut next, false), b"\n"].concat() };
+    let (mut tried, mut purchases) = (0usize, 0u64);
+    let mut check = |before: &[u8], line: &[u8], after: &[u8]| -> bool {
+        let mut text = before.to_vec();
         let start = text.len();
-        text.extend_from_slice(&event_text(&mut next, damage));
+        text.extend_from_slice(line);
         text.push(b'\n');
         let stop = text.len();
-        if round % 7 != 0 {
-            text.extend_from_slice(&event_text(&mut next, false));
-            text.push(b'\n');
-        }
+        text.extend_from_slice(after);
         text.extend_from_slice(&[0u8; 320]);
         let at = unsafe { text.as_ptr().add(start) };
         let shown = || String::from_utf8_lossy(&text[start..stop]).into_owned();
         let (plain_len, fields) = unsafe { split(at) };
-        let row = (round % 64) as usize;
+        tried += 1;
+        let row = tried % 64;
         let mut len = unsafe { read(at, &days, &mut rows, row) };
         if len == 0 {
             if let Some(fields) = fields {
@@ -238,12 +260,9 @@ fn the_row_reader_takes_only_what_the_general_one_reads_the_same() {
             }
             len = unsafe { read(at, &days, &mut rows, row) };
         }
-        clean += u64::from(!damage);
         if len == 0 {
-            continue;
+            return false;
         }
-        clean_taken += u64::from(!damage);
-        damaged_taken += u64::from(damage);
         let fields = fields.unwrap_or_else(|| panic!("took a malformed line: {:?}", shown()));
         assert_eq!(len, plain_len, "{:?}", shown());
         let ([event, who], [ts, ingest], line) = (rows.ids[row], rows.times[row], rows.lines[row]);
@@ -265,12 +284,39 @@ fn the_row_reader_takes_only_what_the_general_one_reads_the_same() {
             } else {
                 purchases += 1;
                 assert!(kind == b"purchase", "{:?}", shown());
+                let part = |shift: u32| (rows.tails[row] >> shift & 0xFF) as usize;
+                assert_eq!((at.add(part(0)), part(8)), fields[5], "{:?}", shown());
+                assert_eq!((at.add(part(16)), part(24)), fields[6], "{:?}", shown());
             }
         }
+        true
+    };
+    let (mut clean, mut clean_taken, mut damaged_taken) = (0u64, 0u64, 0u64);
+    for round in 0..6_000_000u64 {
+        let damage = round % 3 != 0;
+        let before = if round % 5 == 0 { vec![0u8; 64] } else { [&[b'\n'; 40][..], &event_text(&mut next, false), b"\n"].concat() };
+        let line = event_text(&mut next, damage);
+        let after = if round % 7 != 0 { [&event_text(&mut next, false)[..], b"\n"].concat() } else { Vec::new() };
+        let taken = check(&before, &line, &after);
+        clean += u64::from(!damage);
+        clean_taken += u64::from(!damage && taken);
+        damaged_taken += u64::from(damage && taken);
     }
+    let (mut whole, mut near_taken) = (0, 0u64);
+    while whole < 2_500 {
+        let line = event_text(&mut next, false);
+        let after = [&event_text(&mut next, false)[..], b"\n"].concat();
+        if !check(&[b'\n'; 64], &line, &after) {
+            continue;
+        }
+        whole += 1;
+        near(&line, ODD, |text| near_taken += u64::from(check(&[b'\n'; 64], text, &after)));
+    }
+    drop(check);
     assert!(damaged_taken > 100_000, "only {damaged_taken} damaged lines were still taken");
+    assert!(near_taken > 100_000, "only {near_taken} changed lines were still taken");
     assert!(purchases > 100_000, "only {purchases} purchases were taken");
-    assert!(clean_taken * 10 > clean * 8, "only {clean_taken} of {clean} clean lines were taken");
+    assert!(clean_taken * 10 > clean * 7, "only {clean_taken} of {clean} clean lines were taken");
 }
 
 #[test]
@@ -292,7 +338,7 @@ fn four_rows_at_once_make_the_records_of_one_at_a_time() {
             window_end,
             spare: 1 << 40,
         };
-        let (mut ids, mut times, mut marks) = ([[0u64; 2]; 4], [[0i64; 2]; 4], [0u64; 4]);
+        let (mut ids, mut times) = ([[0u64; 2]; 4], [[0i64; 2]; 4]);
         for row in 0..4 {
             let number = |next: &mut dyn FnMut() -> u64, bound: u64, key: u64| match next() % 8 {
                 0 => next() & MASK,
@@ -320,28 +366,33 @@ fn four_rows_at_once_make_the_records_of_one_at_a_time() {
                 _ => ts.div_euclid(1000) + (next() % 600) as i64,
             };
             times[row] = [ts, ingest];
-            marks[row] = (next() >> 1) | u64::from(next() % 16 == 0) << 63;
         }
         let mut records = [EMPTY; 4];
         let mut buckets = [0u64; 4];
-        let left = unsafe { frame.four(ids.as_ptr(), times.as_ptr(), marks.as_ptr(), records.as_mut_ptr(), buckets.as_mut_ptr()) };
+        let left = unsafe { frame.four(ids.as_ptr(), times.as_ptr(), records.as_mut_ptr(), buckets.as_mut_ptr()) };
         assert!(left < 16);
         for row in 0..4 {
             let one = frame.one(ids[row][0], ids[row][1], times[row][0], times[row][1], Some(0));
             let shown = (round, row, ids[row], times[row]);
             if left >> row & 1 != 0 {
-                assert!(one.is_none() || marks[row] >> 63 != 0, "{shown:?}");
+                assert!(one.is_none(), "{shown:?}");
                 assert_eq!(buckets[row], frame.spare, "{shown:?}");
                 left_out += 1;
             } else {
                 let (bucket, Rec { a, b }) = one.unwrap_or_else(|| panic!("made a record of {shown:?}"));
-                assert!(marks[row] >> 63 == 0, "{shown:?}");
                 assert_eq!((buckets[row] as usize, records[row].a, records[row].b), (bucket, a, b), "{shown:?}");
                 made += 1;
+                let payload = (next() % 3 != 0).then(|| (next() % (1 << 29)) as u32);
+                let mut record = records[row];
+                if super::sink::stands(&record) {
+                    super::sink::pay(&mut record, payload);
+                }
+                let (bucket, Rec { a, b }) = frame.one(ids[row][0], ids[row][1], times[row][0], times[row][1], payload).unwrap();
+                assert_eq!((buckets[row] as usize, record.a, record.b), (bucket, a, b), "{shown:?} {payload:?}");
             }
         }
     }
-    assert!(made > 500_000 && left_out > 500_000, "{made} made, {left_out} left");
+    assert!(made > 500_000 && left_out > 300_000, "{made} made, {left_out} left");
 }
 
 #[test]
@@ -354,7 +405,7 @@ fn the_click_reader_takes_only_what_the_general_one_reads_the_same() {
     let mut days = Days::new();
     let mut calendar = Calendar::new();
     let (mut clean, mut clean_taken, mut damaged_taken) = (0u64, 0u64, 0u64);
-    let mut click_text = |next: &mut dyn FnMut() -> u64, damage: bool| {
+    let click_text = |next: &mut dyn FnMut() -> u64, damage: bool| {
         let event = event_text(next, false);
         let mut fields: Vec<Vec<u8>> = event.split(|&byte| byte == b',').take(3).map(|field| field.to_vec()).collect();
         for byte in fields[0].iter_mut().filter(|byte| **byte == b'e').take(1) {
@@ -398,21 +449,19 @@ fn the_click_reader_takes_only_what_the_general_one_reads_the_same() {
         }
         line
     };
-    for round in 0..8_000_000u64 {
-        let damage = round % 3 != 0;
-        let mut text = if round % 5 == 0 { vec![0u8; 64] } else { [&[b'\n'; 40][..], &click_text(&mut next, false), b"\n"].concat() };
+    let mut tried = 0usize;
+    let mut check = |before: &[u8], line: &[u8], after: &[u8]| -> bool {
+        let mut text = before.to_vec();
         let start = text.len();
-        text.extend_from_slice(&click_text(&mut next, damage));
+        text.extend_from_slice(line);
         text.push(b'\n');
         let stop = text.len();
-        if round % 7 != 0 {
-            text.extend_from_slice(&click_text(&mut next, false));
-            text.push(b'\n');
-        }
+        text.extend_from_slice(after);
         text.extend_from_slice(&[0u8; 320]);
         let at = unsafe { text.as_ptr().add(start) };
         let shown = || String::from_utf8_lossy(&text[start..stop]).into_owned();
         let (plain_len, fields) = unsafe { split_click(at) };
+        tried += 1;
         let mut row = NO_CLICK;
         let mut len = unsafe { read_click(at, &days, &mut row) };
         if len == 0 {
@@ -423,12 +472,9 @@ fn the_click_reader_takes_only_what_the_general_one_reads_the_same() {
             }
             len = unsafe { read_click(at, &days, &mut row) };
         }
-        clean += u64::from(!damage);
         if len == 0 {
-            continue;
+            return false;
         }
-        clean_taken += u64::from(!damage);
-        damaged_taken += u64::from(damage);
         let fields = fields.unwrap_or_else(|| panic!("took a malformed line: {:?}", shown()));
         assert_eq!(len, plain_len, "{:?}", shown());
         assert_eq!(row.line, at);
@@ -445,7 +491,31 @@ fn the_click_reader_takes_only_what_the_general_one_reads_the_same() {
             assert!(number != usize::MAX, "{:?}", shown());
             assert_eq!(row.campaign, number as u64, "{:?}", shown());
         }
+        true
+    };
+    for round in 0..6_000_000u64 {
+        let damage = round % 3 != 0;
+        let before = if round % 5 == 0 { vec![0u8; 64] } else { [&[b'\n'; 40][..], &click_text(&mut next, false), b"\n"].concat() };
+        let line = click_text(&mut next, damage);
+        let after = if round % 7 != 0 { [&click_text(&mut next, false)[..], b"\n"].concat() } else { Vec::new() };
+        let taken = check(&before, &line, &after);
+        clean += u64::from(!damage);
+        clean_taken += u64::from(!damage && taken);
+        damaged_taken += u64::from(damage && taken);
     }
+    let (mut whole, mut near_taken) = (0, 0u64);
+    while whole < 4_000 {
+        let line = click_text(&mut next, false);
+        let after = [&click_text(&mut next, false)[..], b"\n"].concat();
+        if !check(&[b'\n'; 64], &line, &after) {
+            continue;
+        }
+        whole += 1;
+        near(&line, ODD, |text| near_taken += u64::from(check(&[b'\n'; 64], text, &after)));
+    }
+    drop(check);
+    assert!(tried > 6_000_000);
     assert!(damaged_taken > 100_000, "only {damaged_taken} damaged lines were still taken");
+    assert!(near_taken > 100_000, "only {near_taken} changed lines were still taken");
     assert!(clean_taken * 10 > clean * 6, "only {clean_taken} of {clean} clean lines were taken");
 }

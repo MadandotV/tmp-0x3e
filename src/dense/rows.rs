@@ -8,6 +8,7 @@ pub struct Rows {
     pub ids: [[u64; 2]; BATCH],
     pub times: [[i64; 2]; BATCH],
     pub lines: [u64; BATCH],
+    pub tails: [u32; BATCH],
 }
 
 pub const PURCHASE: u64 = 1 << 63;
@@ -15,7 +16,7 @@ pub const BATCH: usize = 64;
 
 impl Rows {
     pub fn new() -> Self {
-        Rows { ids: [[0; 2]; BATCH], times: [[0; 2]; BATCH], lines: [0; BATCH] }
+        Rows { ids: [[0; 2]; BATCH], times: [[0; 2]; BATCH], lines: [0; BATCH], tails: [0; BATCH] }
     }
 }
 
@@ -62,7 +63,8 @@ impl Days {
         let place = _pext_u32((at.add(6) as *const u32).read_unaligned(), PLACE) as usize;
         let seconds = days_from_civil(year, month, day) * 86_400;
         let mut kept = [0u8; 16];
-        kept[..10].copy_from_slice(text);
+        kept[0] = b'"';
+        kept[1..11].copy_from_slice(text);
         self.0[place] = Day { text: kept, ms: seconds * 1000, seconds };
     }
 }
@@ -78,49 +80,47 @@ struct IdRow {
     unused: [u8; 16],
 }
 
-const fn id_rows(prefix: u8) -> [IdRow; 128] {
+const fn id_rows(prefix: u8) -> [IdRow; 64] {
     let refuse = {
         let mut want = [0u8; 16];
         want[8] = 1;
         IdRow { pick: [NOTHING; 16], want, lead: [0; 16], unused: [0; 16] }
     };
-    let mut rows = [refuse; 128];
-    let mut index = 0;
-    while index < 128 {
-        let (length, quoted) = (index / 2, index % 2);
-        if length >= 2 + 2 * quoted && length <= 9 + 2 * quoted {
-            let digits = length - 1 - 2 * quoted;
-            let first = 16 - length;
-            let mut row = IdRow { pick: [NOTHING; 16], want: [0; 16], lead: [0; 16], unused: [0; 16] };
-            let mut at = 0;
-            while at < 8 {
-                if at < 8 - digits {
-                    row.want[at] = b'0';
-                } else {
-                    row.pick[at] = (first + quoted + 1 + at - (8 - digits)) as u8;
-                }
-                at += 1;
+    let mut rows = [refuse; 64];
+    let mut length = 2;
+    while length <= 11 {
+        let quoted = if length >= 10 { 1 } else { 0 };
+        let digits = length - 1 - 2 * quoted;
+        let first = 16 - length;
+        let mut row = IdRow { pick: [NOTHING; 16], want: [0; 16], lead: [0; 16], unused: [0; 16] };
+        let mut at = 0;
+        while at < 8 {
+            if at < 8 - digits {
+                row.want[at] = b'0';
+            } else {
+                row.pick[at] = (first + quoted + 1 + at - (8 - digits)) as u8;
             }
-            if digits > 1 {
-                row.lead[8 - digits] = 1;
-            }
-            row.pick[8] = (first + quoted) as u8;
-            row.want[8] = prefix;
-            if quoted == 1 {
-                row.pick[9] = first as u8;
-                row.want[9] = b'"';
-                row.pick[10] = 15;
-                row.want[10] = b'"';
-            }
-            rows[index] = row;
+            at += 1;
         }
-        index += 1;
+        if digits > 1 {
+            row.lead[8 - digits] = 1;
+        }
+        row.pick[8] = (first + quoted) as u8;
+        row.want[8] = prefix;
+        if quoted == 1 {
+            row.pick[9] = first as u8;
+            row.want[9] = b'"';
+            row.pick[10] = 15;
+            row.want[10] = b'"';
+        }
+        rows[length] = row;
+        length += 1;
     }
     rows
 }
 
-static EVENT_IDS: [IdRow; 128] = id_rows(b'e');
-static USER_IDS: [IdRow; 128] = id_rows(b'u');
+static EVENT_IDS: [IdRow; 64] = id_rows(b'e');
+static USER_IDS: [IdRow; 64] = id_rows(b'u');
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
@@ -134,9 +134,10 @@ struct TimeRow {
     gain: [u64; 4],
     back: [i64; 4],
     sign: [u8; 32],
-    dated: [u8; 16],
+    dated: [u8; 32],
     place: u32,
-    unused: [u8; 12],
+    quoted: u32,
+    unused: [u8; 56],
 }
 
 const fn set(part: &mut [u8; 32], half: usize, at: usize, value: u8) {
@@ -205,6 +206,8 @@ const fn plain(row: &mut TimeRow, count: usize, quoted: usize) {
     if quoted == 1 {
         row.pick[0] = 15;
         row.base[0] = b'"';
+        row.pick[1] = (14 - count) as u8;
+        row.base[1] = b'"';
     }
     let mut at = 0;
     while at < 8 {
@@ -221,7 +224,15 @@ const fn plain(row: &mut TimeRow, count: usize, quoted: usize) {
     row.back[0] = -1;
 }
 
-const fn time_rows() -> [TimeRow; 256] {
+const fn dated(row: &mut TimeRow, half: usize, quoted: usize) {
+    let mut at = 1 - quoted;
+    while at <= 10 {
+        row.dated[half * 16 + at] = 0xFF;
+        at += 1;
+    }
+}
+
+const fn time_rows() -> [TimeRow; 128] {
     let empty = TimeRow {
         pick: [NOTHING; 32],
         base: [0; 32],
@@ -232,24 +243,24 @@ const fn time_rows() -> [TimeRow; 256] {
         gain: [0; 4],
         back: [0; 4],
         sign: [0; 32],
-        dated: [0; 16],
+        dated: [0; 32],
         place: 0,
-        unused: [0; 12],
+        quoted: 0,
+        unused: [0; 56],
     };
-    let mut rows = [empty; 256];
+    let mut rows = [empty; 128];
     let mut index = 0;
-    while index < 256 {
-        let (raw, quoted, ingest_quoted) = (index / 4, index / 2 % 2, index % 2);
+    while index < 128 {
+        let (raw, ingest_quoted) = (index / 2, index % 2);
         let row = &mut rows[index];
         calendar(row, 1, 20, ingest_quoted);
-        let length = if raw >= 2 * quoted { raw - 2 * quoted } else { 0 };
+        dated(row, 1, ingest_quoted);
+        let quoted = if raw == 15 || raw == 22 || raw == 27 { 1 } else { 0 };
+        let length = raw - 2 * quoted;
+        row.quoted = quoted as u32;
         if length == 20 || length == 25 {
             calendar(row, 0, length, quoted);
-            let mut at = 0;
-            while at < 10 {
-                row.dated[at] = 0xFF;
-                at += 1;
-            }
+            dated(row, 0, quoted);
             row.place = PLACE;
         } else if length >= 1 && length <= 16 - 2 * quoted {
             plain(row, length, quoted);
@@ -261,14 +272,51 @@ const fn time_rows() -> [TimeRow; 256] {
     rows
 }
 
-static TIMES: [TimeRow; 256] = time_rows();
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct TailRow {
+    span: u64,
+    opens: u64,
+    quotes: [u64; 4],
+    unused: [u64; 2],
+}
+
+const fn tail_rows() -> [TailRow; 4096] {
+    const NEVER: u64 = u64::MAX;
+    let mut rows = [TailRow { span: 0, opens: 0, quotes: [NEVER; 4], unused: [0; 2] }; 4096];
+    let mut index = 0;
+    while index < 4096 {
+        let (product, price) = (index / 64, index % 64);
+        if product >= 1 && product + 1 + price <= 63 {
+            let row = &mut rows[index];
+            row.span = (1 << (product + 1 + price)) - 1;
+            row.opens = 1 | if price > 0 { 1 << (product + 1) } else { 0 };
+            let wrapped_product = 1 | 1 << (product - 1);
+            let wrapped_price = if price >= 2 { (1 | 1 << (price - 1)) << (product + 1) } else { 0 };
+            row.quotes[0] = 0;
+            if product >= 3 {
+                row.quotes[1] = wrapped_product;
+            }
+            if price >= 2 {
+                row.quotes[2] = wrapped_price;
+            }
+            if product >= 3 && price >= 2 {
+                row.quotes[3] = wrapped_product | wrapped_price;
+            }
+        }
+        index += 1;
+    }
+    rows
+}
+
+static TAILS: [TailRow; 4096] = tail_rows();
+static TIMES: [TimeRow; 128] = time_rows();
 
 #[repr(align(32))]
 struct Wide<T>(T);
 
 static ID_PAIRS: Wide<[u8; 32]> = Wide([36, 1, 36, 1, 36, 1, 36, 1, 0, 0, 0, 0, 0, 0, 0, 0, 36, 1, 36, 1, 36, 1, 36, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
 static ID_FOURS: Wide<[i16; 16]> = Wide([1296, 1, 1296, 1, 0, 0, 0, 0, 1296, 1, 1296, 1, 0, 0, 0, 0]);
-static INGEST_DATED: Wide<[u8; 32]> = Wide([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 
 #[inline(always)]
 unsafe fn two(low: *const u8, high: *const u8) -> __m256i {
@@ -312,16 +360,14 @@ pub unsafe fn read(at: *const u8, days: *const Days, rows: *mut Rows, row: usize
     let before = before.wrapping_shl(product as u32) << 1;
     let kind = u64::from(before.leading_zeros());
     let c3 = 93u64.wrapping_sub(gap).wrapping_sub(product).wrapping_sub(kind) as usize;
-    let q3 = usize::from(*at.add(c2 + 1) == b'"');
-    if (end > 63) | (c2 > 63) | (kind > 63) | (c3 != c2 + 21 + 2 * q3) {
+    let longer = c3.wrapping_sub(c2 + 21);
+    if (end > 63) | (c2 > 63) | (kind > 63) | (longer & !2 != 0) {
         return 0;
     }
-    let q0 = usize::from(*at == b'"');
-    let q1 = usize::from(*at.add(c0 + 1) == b'"');
-    let q2 = usize::from(*at.add(c1 + 1) == b'"');
+    let q3 = longer >> 1;
 
-    let event = EVENT_IDS.get_unchecked(c0 * 2 + q0);
-    let user = USER_IDS.get_unchecked((c1 - c0 - 1) * 2 + q1);
+    let event = EVENT_IDS.get_unchecked(c0);
+    let user = USER_IDS.get_unchecked(c1 - c0 - 1);
     let text = two(at.add(c0).sub(16), at.add(c1).sub(16));
     let moved = _mm256_xor_si256(_mm256_shuffle_epi8(text, two(event.pick.as_ptr(), user.pick.as_ptr())), two(event.want.as_ptr(), user.want.as_ptr()));
     let above = _mm256_cmpgt_epi8(moved, _mm256_set1_epi8(b'9' as i8));
@@ -334,7 +380,7 @@ pub unsafe fn read(at: *const u8, days: *const Days, rows: *mut Rows, row: usize
     wrong = _mm256_or_si256(wrong, _mm256_cmpgt_epi64(ids, _mm256_set1_epi64x(super::codec::MASK as i64)));
     _mm_storeu_si128((*rows).ids.as_mut_ptr().add(row) as *mut __m128i, _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(ids)));
 
-    let time = TIMES.get_unchecked((c2 - c1 - 1) * 4 + q2 * 2 + q3);
+    let time = TIMES.get_unchecked((c2 - c1 - 1) * 2 + q3);
     let text = two(at.add(c2).sub(16), at.add(c3).sub(16));
     let digits = _mm256_sub_epi8(_mm256_shuffle_epi8(text, whole(&time.pick)), whole(&time.base));
     wrong = _mm256_or_si256(wrong, _mm256_subs_epu8(digits, whole(&time.most)));
@@ -345,16 +391,12 @@ pub unsafe fn read(at: *const u8, days: *const Days, rows: *mut Rows, row: usize
     let back = _mm256_mul_epi32(_mm256_srli_epi64::<32>(folded), whole(&time.back));
     let off = _mm256_cmpeq_epi64(_mm256_and_si256(digits, whole(&time.sign)), _mm256_setzero_si256());
     let mut times = _mm256_add_epi64(gained, _mm256_sub_epi64(_mm256_xor_si256(back, off), off));
-    let ts_text = at.add(c1 + 1 + q2);
-    let ts_day = (days as *const Day).add(_pext_u32((ts_text.add(6) as *const u32).read_unaligned(), time.place) as usize);
-    let ts_day = _mm256_load_si256(ts_day as *const __m256i);
-    let ts_differs = _mm_and_si128(_mm_xor_si128(_mm_loadu_si128(ts_text as *const __m128i), _mm256_castsi256_si128(ts_day)), _mm_load_si128(time.dated.as_ptr() as *const __m128i));
-    let ingest_text = at.add(c2 + 1 + q3);
-    let ingest_day = (days as *const Day).add(_pext_u32((ingest_text.add(6) as *const u32).read_unaligned(), PLACE) as usize);
-    let ingest_day = _mm256_load_si256(ingest_day as *const __m256i);
-    let ingest_differs = _mm_and_si128(_mm_xor_si128(_mm_loadu_si128(ingest_text as *const __m128i), _mm256_castsi256_si128(ingest_day)), _mm_load_si128(INGEST_DATED.0.as_ptr() as *const __m128i));
-    wrong = _mm256_or_si256(wrong, _mm256_castsi128_si256(_mm_or_si128(ts_differs, ingest_differs)));
-    times = _mm256_add_epi64(times, _mm256_permute2x128_si256::<0x31>(ts_day, ingest_day));
+    let ts_text = at.add(c1 + time.quoted as usize);
+    let ts_day = (days as *const Day).add(_pext_u32((ts_text.add(7) as *const u32).read_unaligned(), time.place) as usize) as *const u8;
+    let ingest_text = at.add(c2 + q3);
+    let ingest_day = (days as *const Day).add(_pext_u32((ingest_text.add(7) as *const u32).read_unaligned(), PLACE) as usize) as *const u8;
+    wrong = _mm256_or_si256(wrong, _mm256_and_si256(_mm256_xor_si256(two(ts_text, ingest_text), two(ts_day, ingest_day)), whole(&time.dated)));
+    times = _mm256_add_epi64(times, two(ts_day.add(16), ingest_day.add(16)));
     _mm_storeu_si128((*rows).times.as_mut_ptr().add(row) as *mut __m128i, _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1100>(times)));
 
     let tail = at.add(32);
@@ -362,12 +404,9 @@ pub unsafe fn read(at: *const u8, days: *const Days, rows: *mut Rows, row: usize
     let word = (type_at as *const u64).read_unaligned();
     let (five, seven) = (word & 0xFF_FFFF_FFFF, word & 0xFF_FFFF_FFFF_FFFF);
     let browse = (five == VIEW) | (five == CART) | (seven == VIEW_QUOTED) | (seven == CART_QUOTED);
-    let span = product + 1 + price;
-    let theirs = _bzhi_u64(quotes >> (63 - gap - product), span as u32);
-    let (qp, qr) = (theirs & 1, theirs >> (product + 1) & 1);
-    let allowed = (qp | qp.wrapping_shl(product.wrapping_sub(1) as u32)) | (qr | qr.wrapping_shl(price.wrapping_sub(1) as u32)) << (product + 1);
-    let (product_len, price_len) = (product.wrapping_sub(2 * qp), price.wrapping_sub(2 * qr));
-    let odd = (theirs != allowed) | ((product_len as i64) < 1) | ((price_len as i64) < 0);
+    let pair = TAILS.get_unchecked((product * 64 + price) as usize);
+    let theirs = quotes >> (63 - gap - product) & pair.span;
+    let odd = theirs != *pair.quotes.get_unchecked(_pext_u64(theirs, pair.opens) as usize);
     if (_mm256_testz_si256(wrong, wrong) == 0) | odd {
         return 0;
     }
@@ -380,6 +419,9 @@ pub unsafe fn read(at: *const u8, days: *const Days, rows: *mut Rows, row: usize
             return 0;
         }
         line |= PURCHASE;
+        let (qp, qr) = (theirs & 1, theirs >> (product + 1) & 1);
+        let (product_at, price_at) = (32 + 63 - gap - product + qp, 32 + 64 - gap + qr);
+        *(*rows).tails.as_mut_ptr().add(row) = (product_at | (product - 2 * qp) << 8 | price_at << 16 | (price - 2 * qr) << 24) as u32;
     }
     *(*rows).lines.as_mut_ptr().add(row) = line;
     33 + end as usize
@@ -414,7 +456,8 @@ struct Half {
     sign: [u8; 16],
     dated: [u8; 16],
     place: u32,
-    unused: [u8; 28],
+    quoted: u32,
+    unused: [u8; 24],
 }
 
 const fn lower(row: &TimeRow) -> Half {
@@ -428,9 +471,10 @@ const fn lower(row: &TimeRow) -> Half {
         gain: [row.gain[0], row.gain[1]],
         back: [row.back[0], row.back[1]],
         sign: [0; 16],
-        dated: row.dated,
+        dated: [0; 16],
         place: row.place,
-        unused: [0; 28],
+        quoted: row.quoted,
+        unused: [0; 24],
     };
     let mut at = 0;
     while at < 16 {
@@ -438,6 +482,7 @@ const fn lower(row: &TimeRow) -> Half {
         half.base[at] = row.base[at];
         half.most[at] = row.most[at];
         half.sign[at] = row.sign[at];
+        half.dated[at] = row.dated[at];
         if at < 8 {
             half.tens[at] = row.tens[at];
             half.fold[at] = row.fold[at];
@@ -450,11 +495,11 @@ const fn lower(row: &TimeRow) -> Half {
     half
 }
 
-const fn ts_halves() -> [Half; 128] {
+const fn ts_halves() -> [Half; 64] {
     let rows = time_rows();
-    let mut halves = [lower(&rows[0]); 128];
+    let mut halves = [lower(&rows[0]); 64];
     let mut index = 0;
-    while index < 128 {
+    while index < 64 {
         halves[index] = lower(&rows[index * 2]);
         index += 1;
     }
@@ -466,6 +511,7 @@ const fn campaign_halves() -> [Half; 32] {
         let mut half = lower(&time_rows()[0]);
         half.dated = [0; 16];
         half.place = 0;
+        half.quoted = 0;
         half
     };
     let mut halves = [refuse; 32];
@@ -487,7 +533,8 @@ const fn campaign_halves() -> [Half; 32] {
                 sign: [0; 16],
                 dated: [0; 16],
                 place: 0,
-                unused: [0; 28],
+                quoted: 0,
+                unused: [0; 24],
             };
             let mut at = 0;
             let mut short = 1u64;
@@ -524,8 +571,8 @@ const fn campaign_halves() -> [Half; 32] {
     halves
 }
 
-static CLICK_IDS: [IdRow; 128] = id_rows(b'k');
-static TS_HALVES: [Half; 128] = ts_halves();
+static CLICK_IDS: [IdRow; 64] = id_rows(b'k');
+static TS_HALVES: [Half; 64] = ts_halves();
 static CAMPAIGNS: [Half; 32] = campaign_halves();
 
 #[inline(always)]
@@ -544,13 +591,10 @@ pub unsafe fn read_click(at: *const u8, days: *const Days, row: *mut Click) -> u
     if (end > 63) | (c2 > 63) | (rest & rest.wrapping_sub(1) != 0) {
         return 0;
     }
-    let q0 = usize::from(*at == b'"');
-    let q1 = usize::from(*at.add(c0 + 1) == b'"');
     let q2 = usize::from(*at.add(c1 + 1) == b'"');
-    let q3 = usize::from(*at.add(c2 + 1) == b'"');
 
-    let click = CLICK_IDS.get_unchecked(c0 * 2 + q0);
-    let user = USER_IDS.get_unchecked((c1 - c0 - 1) * 2 + q1);
+    let click = CLICK_IDS.get_unchecked(c0);
+    let user = USER_IDS.get_unchecked(c1 - c0 - 1);
     let text = two(at.add(c0).sub(16), at.add(c1).sub(16));
     let moved = _mm256_xor_si256(_mm256_shuffle_epi8(text, two(click.pick.as_ptr(), user.pick.as_ptr())), two(click.want.as_ptr(), user.want.as_ptr()));
     let above = _mm256_cmpgt_epi8(moved, _mm256_set1_epi8(b'9' as i8));
@@ -563,7 +607,7 @@ pub unsafe fn read_click(at: *const u8, days: *const Days, row: *mut Click) -> u
     wrong = _mm256_or_si256(wrong, _mm256_cmpgt_epi64(ids, _mm256_set1_epi64x(super::codec::MASK as i64)));
     _mm_storeu_si128(row as *mut __m128i, _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(ids)));
 
-    let time = TS_HALVES.get_unchecked((end - c2 - 1) * 2 + q3);
+    let time = TS_HALVES.get_unchecked(end - c2 - 1);
     let campaign = CAMPAIGNS.get_unchecked((c2 - c1 - 1).min(15) * 2 + q2);
     let text = two(at.add(end).sub(16), at.add(c2).sub(16));
     let digits = _mm256_sub_epi8(_mm256_shuffle_epi8(text, two(time.pick.as_ptr(), campaign.pick.as_ptr())), two(time.base.as_ptr(), campaign.base.as_ptr()));
@@ -575,8 +619,8 @@ pub unsafe fn read_click(at: *const u8, days: *const Days, row: *mut Click) -> u
     let back = _mm256_mul_epi32(_mm256_srli_epi64::<32>(folded), two(time.back.as_ptr() as *const u8, campaign.back.as_ptr() as *const u8));
     let off = _mm256_cmpeq_epi64(_mm256_and_si256(digits, two(time.sign.as_ptr(), campaign.sign.as_ptr())), _mm256_setzero_si256());
     let mut times = _mm256_add_epi64(gained, _mm256_sub_epi64(_mm256_xor_si256(back, off), off));
-    let ts_text = at.add(c2 + 1 + q3);
-    let ts_day = (days as *const Day).add(_pext_u32((ts_text.add(6) as *const u32).read_unaligned(), time.place) as usize);
+    let ts_text = at.add(c2 + time.quoted as usize);
+    let ts_day = (days as *const Day).add(_pext_u32((ts_text.add(7) as *const u32).read_unaligned(), time.place) as usize);
     let differs = _mm_and_si128(_mm_xor_si128(_mm_loadu_si128(ts_text as *const __m128i), _mm_load_si128(ts_day as *const __m128i)), _mm_load_si128(time.dated.as_ptr() as *const __m128i));
     wrong = _mm256_or_si256(wrong, _mm256_castsi128_si256(differs));
     times = _mm256_add_epi64(times, two((ts_day as *const u8).add(16), campaign.dated.as_ptr()));

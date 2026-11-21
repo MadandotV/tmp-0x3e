@@ -18,6 +18,8 @@ pub fn huge_pages() -> Huge {
         let has = |word: &[u8]| mode.windows(word.len()).any(|window| window == word);
         if std::env::var_os("NB7X_SMALL_PAGES").is_some() {
             Huge::Never
+        } else if std::env::var_os("NB7X_PLAIN_PAGES").is_some() {
+            Huge::Always
         } else if has(b"[always]") {
             Huge::Always
         } else if has(b"[madvise]") {
@@ -46,8 +48,31 @@ pub fn zeroed(bytes: usize, populate: bool) -> *mut u8 {
         if huge == Huge::OnRequest {
             libc::madvise(at as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
         }
+        REGIONS.lock().unwrap().push((at as usize, bytes));
         at
     }
+}
+
+static REGIONS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn release_all() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    const PIECE: usize = 16 << 20;
+    let mut pieces = Vec::new();
+    for &(at, bytes) in REGIONS.lock().unwrap().iter() {
+        let mut from = at;
+        while from < at + bytes {
+            let to = (from + PIECE).min(at + bytes);
+            pieces.push((from, to - from));
+            from = to;
+        }
+    }
+    let next = AtomicUsize::new(0);
+    super::pool::run(super::pool::threads(), |_| {
+        while let Some(&(at, bytes)) = pieces.get(next.fetch_add(1, Relaxed)) {
+            unsafe { libc::madvise(at as *mut libc::c_void, bytes, libc::MADV_DONTNEED) };
+        }
+    });
 }
 
 pub fn shared(bytes: usize) -> *mut u8 {

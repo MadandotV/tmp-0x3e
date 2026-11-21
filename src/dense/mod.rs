@@ -198,8 +198,8 @@ fn detect(link_paths: &[PathBuf], event_paths: &[PathBuf]) -> Result<Plan, &'sta
     }
     let Some((event_key, most_event)) = event else { return Err("no event key from the sample") };
 
-    let users = ((most_user >> ALIAS_BITS) as usize + 1) * 5 / 4 + (1 << USER_BITS);
-    let users = users.next_multiple_of(1 << USER_BITS).min(MOST_USERS);
+    let users = ((most_user >> ALIAS_BITS) as usize + 1) * 5 / 4 + (1 << 12);
+    let users = users.next_multiple_of(1 << 12).min(MOST_USERS);
     let event_bound = ((most_event + 1) * 5 / 4 + BUCKET as u64).next_multiple_of(BUCKET as u64).min(MOST_BUCKETS << BUCKET_BITS);
     Ok(Plan { user_key, event_key, users, event_bound })
 }
@@ -422,26 +422,36 @@ impl lines::Events for Parser<'_> {
 
     #[inline(always)]
     unsafe fn rows(&mut self, rows: &rows::Rows, count: usize) {
+        use std::arch::x86_64::*;
         let frame = &self.shared.frame;
-        let mut records = [EMPTY; rows::BATCH];
-        let mut buckets = [0u64; rows::BATCH];
-        let mut left = 0u64;
+        let mut records = [std::mem::MaybeUninit::<Rec>::uninit(); rows::BATCH];
+        let mut buckets = [std::mem::MaybeUninit::<u64>::uninit(); rows::BATCH];
+        let (records, buckets) = (records.as_mut_ptr() as *mut Rec, buckets.as_mut_ptr() as *mut u64);
+        let (mut left, mut bought) = (0u64, 0u64);
         let whole = count & !3;
         let mut at = 0;
         while at < whole {
-            let some = frame.four(rows.ids.as_ptr().add(at), rows.times.as_ptr().add(at), rows.lines.as_ptr().add(at), records.as_mut_ptr().add(at), buckets.as_mut_ptr().add(at));
+            let some = frame.four(rows.ids.as_ptr().add(at), rows.times.as_ptr().add(at), records.add(at), buckets.add(at));
             left |= u64::from(some) << at;
+            bought |= (_mm256_movemask_pd(_mm256_loadu_pd(rows.lines.as_ptr().add(at) as *const f64)) as u64) << at;
             at += 4;
         }
+        let mut priced = bought & !left;
+        while priced != 0 {
+            let at = priced.trailing_zeros() as usize;
+            priced &= priced - 1;
+            self.price(*rows.lines.get_unchecked(at), *rows.tails.get_unchecked(at), &mut *records.add(at));
+        }
         for at in 0..whole {
-            self.events.push(*buckets.get_unchecked(at) as usize, *records.get_unchecked(at));
+            self.events.push(*buckets.add(at) as usize, *records.add(at));
         }
         while left != 0 {
-            self.row(rows, left.trailing_zeros() as usize);
+            PLAIN.fetch_add(1, Relaxed);
+            self.again(*rows.lines.get_unchecked(left.trailing_zeros() as usize));
             left &= left - 1;
         }
         for at in whole..count {
-            self.row(rows, at);
+            self.again(*rows.lines.get_unchecked(at));
         }
     }
 }
@@ -485,28 +495,25 @@ impl Parser<'_> {
         }
     }
 
+    #[inline(never)]
+    unsafe fn price(&self, line: u64, tail: u32, record: &mut Rec) {
+        if !sink::stands(record) {
+            return;
+        }
+        let line = (line & !rows::PURCHASE) as *const u8;
+        let part = |shift: u32| (tail >> shift & 0xFF) as usize;
+        let payload = match number(line.add(part(16)), part(24)) {
+            Some(value) if (1..=10_000_000).contains(&value) => Some(u32::from(self.shared.context.category(line.add(part(0)), part(8))) << 24 | value as u32),
+            _ => None,
+        };
+        sink::pay(record, payload);
+    }
+
     #[cold]
     #[inline(never)]
-    unsafe fn row(&mut self, rows: &rows::Rows, at: usize) {
-        let ([event, who], [ts, ingest]) = (rows.ids[at], rows.times[at]);
-        let line = (rows.lines[at] & !rows::PURCHASE) as *const u8;
-        let (_, Some(fields)) = lines::split(line) else { return };
-        let payload = if rows.lines[at] & rows::PURCHASE == 0 {
-            Some(0)
-        } else {
-            match number(fields[6].0, fields[6].1) {
-                Some(value) if (1..=10_000_000).contains(&value) => Some(u32::from(self.shared.context.category(fields[5].0, fields[5].1)) << 24 | value as u32),
-                _ => None,
-            }
-        };
-        match self.shared.frame.one(event, who, ts, ingest, payload) {
-            Some((bucket, record)) => {
-                self.events.push(bucket, record);
-            }
-            None => {
-                PLAIN.fetch_add(1, Relaxed);
-                self.event_line(&fields);
-            }
+    unsafe fn again(&mut self, line: u64) {
+        if let (_, Some(fields)) = lines::split((line & !rows::PURCHASE) as *const u8) {
+            self.event_line(&fields);
         }
     }
 }
@@ -601,6 +608,7 @@ struct Local<'a> {
     bought: Vec<[i64; 2]>,
     table: Table,
     best: Vec<Rec>,
+    mark: u64,
     who: Vec<u32>,
     events: Vec<u64>,
     sorted: Vec<u64>,
@@ -661,17 +669,162 @@ fn steps_done() {
 
 const TOP: u32 = 1 << 31;
 const LOW: u32 = TOP - 1;
+const LOW_50: u64 = (1 << 50) - 1;
+const MARKS: u64 = (1 << 14) - 2;
+const UNUSED: Rec = Rec { a: 0, b: u64::MAX };
+
+#[inline(never)]
+unsafe fn keep_earliest(chunk: &[Rec], best: *mut Rec, mark: u64) {
+    for record in chunk {
+        let low = (record.b >> 50 | record.a >> 63 << 14) as usize;
+        let kept = best.add(low);
+        let new = Rec { a: record.a, b: record.b & LOW_50 | mark };
+        *kept = if new.b < (*kept).b { new } else { *kept };
+    }
+}
+
+static FRONT: [[u8; 16]; 16] = {
+    let mut table = [[0x80u8; 16]; 16];
+    let mut mask = 0;
+    while mask < 16 {
+        let (mut lane, mut out) = (0, 0);
+        while lane < 4 {
+            if mask >> lane & 1 != 0 {
+                let mut byte = 0;
+                while byte < 4 {
+                    table[mask][out * 4 + byte] = (lane * 4 + byte) as u8;
+                    byte += 1;
+                }
+                out += 1;
+            }
+            lane += 1;
+        }
+        mask += 1;
+    }
+    table
+};
+
+#[inline(never)]
+unsafe fn pack(best: *const Rec, marked: u64, who: *mut u32, ts: *mut u32, slots: *mut u32, buys: *mut u8) -> (usize, bool) {
+    use std::arch::x86_64::*;
+    std::ptr::write_bytes(buys, 0, BUCKET / 8 + 8);
+    let halves = _mm256_setr_epi32(0, 4, 2, 6, 1, 5, 3, 7);
+    let mark = _mm_set1_epi32(marked as i32);
+    let invalid = _mm_set1_epi32(INVALID as i32);
+    let payload = _mm_set1_epi32(0x1FFF_FFFF);
+    let mut slot = _mm_setr_epi32(0, 1, 2, 3);
+    let four = _mm_set1_epi32(4);
+    let (mut count, mut foreign) = (0usize, 0);
+    for group in 0..BUCKET / 4 {
+        let (even, odd) = (_mm256_loadu_si256(best.add(4 * group) as *const __m256i), _mm256_loadu_si256(best.add(4 * group + 2) as *const __m256i));
+        let firsts = _mm256_permutevar8x32_epi32(_mm256_unpacklo_epi64(even, odd), halves);
+        let seconds = _mm256_permutevar8x32_epi32(_mm256_unpackhi_epi64(even, odd), halves);
+        let users = _mm256_castsi256_si128(firsts);
+        let stamps = _mm_and_si128(_mm256_extracti128_si256(firsts, 1), invalid);
+        let marks = _mm_srli_epi32(_mm256_extracti128_si256(seconds, 1), 18);
+        let valid = _mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(_mm_cmpeq_epi32(stamps, invalid), _mm_cmpeq_epi32(marks, mark)))) as usize;
+        let other = _mm_movemask_ps(_mm_castsi128_ps(users)) as usize;
+        let keep = valid & !other;
+        foreign |= valid & other;
+        let front = _mm_loadu_si128(FRONT.as_ptr().add(keep) as *const __m128i);
+        _mm_storeu_si128(who.add(count) as *mut __m128i, _mm_shuffle_epi8(users, front));
+        _mm_storeu_si128(ts.add(count) as *mut __m128i, _mm_shuffle_epi8(stamps, front));
+        _mm_storeu_si128(slots.add(count) as *mut __m128i, _mm_shuffle_epi8(slot, front));
+        slot = _mm_add_epi32(slot, four);
+        let free = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm256_castsi256_si128(seconds), payload), _mm_setzero_si128()))) as usize;
+        let mut bought = keep & !free;
+        while bought != 0 {
+            let at = count + (keep & ((bought & bought.wrapping_neg()) - 1)).count_ones() as usize;
+            *buys.add(at >> 3) |= 1 << (at & 7);
+            bought &= bought - 1;
+        }
+        count += keep.count_ones() as usize;
+    }
+    (count, foreign != 0)
+}
+
+#[inline(always)]
+unsafe fn front8(lanes: std::arch::x86_64::__m256i, mask: u32) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+    let places = _pext_u64(0x0706_0504_0302_0100, _pdep_u64(u64::from(mask), 0x0101_0101_0101_0101) * 255);
+    _mm256_permutevar8x32_epi32(lanes, _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(places as i64)))
+}
+
+#[inline(never)]
+unsafe fn sessions_of(who: *mut u32, ts: *mut u32, count: usize, buys: *const u8, first: *mut u32, start: *mut u32, bought: *mut u64) -> (usize, usize, bool) {
+    use std::arch::x86_64::*;
+    *who.sub(1) = u32::MAX;
+    *ts.sub(1) = 0;
+    let gap = _mm256_set1_epi32(GAP as i32);
+    let top = _mm256_set1_epi32(TOP as i32);
+    let eight = _mm256_set1_epi32(8);
+    let mut number = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let (mut sessions, mut purchases, mut back) = (0usize, 0usize, 0u32);
+    let mut at = 0;
+    while at < count {
+        let left = count - at;
+        let real = if left >= 8 { 255 } else { (1u32 << left) - 1 };
+        let users = _mm256_loadu_si256(who.add(at) as *const __m256i);
+        let stamps = _mm256_loadu_si256(ts.add(at) as *const __m256i);
+        let same = _mm256_cmpeq_epi32(_mm256_srli_epi32(_mm256_xor_si256(users, _mm256_loadu_si256(who.add(at).sub(1) as *const __m256i)), ALIAS_BITS as i32), _mm256_setzero_si256());
+        let since = _mm256_sub_epi32(stamps, _mm256_loadu_si256(ts.add(at).sub(1) as *const __m256i));
+        let near = _mm256_cmpeq_epi32(_mm256_min_epu32(since, gap), since);
+        let continues = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(same, near))) as u32;
+        let starts = !continues & real;
+        back |= _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_and_si256(same, since))) as u32 & real;
+        _mm256_storeu_si256(first.add(sessions) as *mut __m256i, front8(_mm256_or_si256(number, _mm256_andnot_si256(same, top)), starts));
+        _mm256_storeu_si256(start.add(sessions) as *mut __m256i, front8(stamps, starts));
+        number = _mm256_add_epi32(number, eight);
+        let mut buying = u32::from(*buys.add(at >> 3));
+        while buying != 0 {
+            let lane = buying.trailing_zeros();
+            let session = sessions + (starts & ((2 << lane) - 1)).count_ones() as usize - 1;
+            *bought.add(purchases) = (session as u64) << 32 | (at as u64 + u64::from(lane));
+            purchases += 1;
+            buying &= buying - 1;
+        }
+        sessions += starts.count_ones() as usize;
+        at += 8;
+    }
+    (sessions, purchases, back != 0)
+}
+
+#[inline(always)]
+unsafe fn aliases(who: *const u32, from: usize, to: usize) -> u32 {
+    use std::arch::x86_64::*;
+    static REAL: [u32; 16] = [u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX, 0, 0, 0, 0, 0, 0, 0, 0];
+    let (low, most, one) = (_mm256_set1_epi32(511), _mm256_set1_epi32(8), _mm256_set1_epi32(1));
+    let mut all = _mm256_setzero_si256();
+    let mut at = from;
+    while at < to {
+        let real = _mm256_loadu_si256(REAL.as_ptr().add(8 - (to - at).min(8)) as *const __m256i);
+        let alias = _mm256_min_epu32(_mm256_and_si256(_mm256_loadu_si256(who.add(at) as *const __m256i), low), most);
+        all = _mm256_or_si256(all, _mm256_and_si256(_mm256_sllv_epi32(one, alias), real));
+        at += 8;
+    }
+    let half = _mm_or_si128(_mm256_castsi256_si128(all), _mm256_extracti128_si256(all, 1));
+    let pair = _mm_or_si128(half, _mm_unpackhi_epi64(half, half));
+    (_mm_cvtsi128_si32(pair) | _mm_extract_epi32(pair, 1)) as u32
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn gather(best: *const Rec, who: *const u32, ts: *const u32, slots: *const u32, from: usize, to: usize, ids: &mut Vec<u32>, events: &mut Vec<u64>) {
+    ids.extend_from_slice(std::slice::from_raw_parts(who.add(from), to - from));
+    events.extend((from..to).map(|at| u64::from(*ts.add(at)) << 32 | (*best.add(*slots.add(at) as usize)).b & 0x1FFF_FFFF));
+}
 
 #[derive(Default)]
 struct Table {
+    who: Vec<u32>,
+    ts: Vec<u32>,
+    slots: Vec<u32>,
+    buys: Vec<u8>,
     first: Vec<u32>,
     start: Vec<u32>,
     day: Vec<u32>,
     campaign: Vec<u32>,
     row: Vec<u32>,
-    breaks: Vec<u32>,
-    bought: Vec<u32>,
-    bought_in: Vec<u32>,
+    bought: Vec<u64>,
     row_session: Vec<u32>,
     row_event: Vec<u32>,
     row_revenue: Vec<i64>,
@@ -685,14 +838,17 @@ impl Table {
     fn new() -> Table {
         let size = BUCKET + 16;
         Table {
+            who: vec![0; size],
+            ts: vec![0; size],
+            slots: vec![0; size],
+            buys: vec![0; BUCKET / 8 + 8],
             first: vec![0; size],
             start: vec![0; size],
             day: vec![0; size],
             campaign: vec![0; size],
             row: vec![0; size],
-            breaks: vec![0; size],
+
             bought: vec![0; size],
-            bought_in: vec![0; size],
             row_session: vec![0; size],
             row_event: vec![0; size],
             row_revenue: vec![0; size],
@@ -778,44 +934,16 @@ impl<'a> Local<'a> {
         let stage = self.stage;
         let best = self.best.as_mut_ptr();
         let mut clock = if PROFILE { std::arch::x86_64::_rdtsc() } else { 0 };
+        self.mark -= 1;
+        if self.mark == 0 {
+            self.best.fill(UNUSED);
+            self.mark = MARKS;
+        }
+        let (mark, marked) = (self.mark << 50, self.mark);
         for thread in stage.parsed {
-            thread.events.for_each_chunk(part, |chunk| {
-                for record in chunk {
-                    let low = (record.b >> 50 | record.a >> 63 << 14) as usize;
-                    let kept = best.add(low);
-                    let (new, old) = (record.b >> 29 & 0x1F_FFFF, (*kept).b >> 29 & 0x1F_FFFF);
-                    if old == 0 || new < old {
-                        *kept = *record;
-                    }
-                }
-            });
+            thread.events.for_each_chunk(part, |chunk| keep_earliest(chunk, best, mark));
         }
         step(&mut clock, 0);
-        self.who.clear();
-        self.events.clear();
-        self.who.reserve(BUCKET + 1);
-        self.events.reserve(BUCKET + 1);
-        let (who, events) = (self.who.as_mut_ptr(), self.events.as_mut_ptr());
-        let mut count = 0;
-        for low in 0..BUCKET {
-            let record = *best.add(low);
-            *best.add(low) = EMPTY;
-            let stamp = record.a >> 32 & INVALID;
-            let keep = record.b != 0 && stamp != INVALID;
-            let (user, event) = (record.a as u32, stamp << 32 | record.b & 0x1FFF_FFFF);
-            if u32::from(keep) & user >> 31 != 0 {
-                let person = stage.person(user);
-                self.side_event(person, event);
-                continue;
-            }
-            *who.add(count) = user;
-            *events.add(count) = event;
-            count += usize::from(keep);
-        }
-        step(&mut clock, 1);
-        if count == 0 {
-            return;
-        }
         let context = stage.shared.context;
         let days = context.days as u32;
         let organic = context.campaign_ids.len() as u32;
@@ -824,32 +952,23 @@ impl<'a> Local<'a> {
         let t = &mut table;
         let (first, start, day_of, campaign_of, row_of) =
             (t.first.as_mut_ptr(), t.start.as_mut_ptr(), t.day.as_mut_ptr(), t.campaign.as_mut_ptr(), t.row.as_mut_ptr());
-        let (breaks, bought, bought_in) = (t.breaks.as_mut_ptr(), t.bought.as_mut_ptr(), t.bought_in.as_mut_ptr());
+        let (who, ts, slots) = (t.who.as_mut_ptr().add(8), t.ts.as_mut_ptr().add(8), t.slots.as_mut_ptr().add(8));
+        let bought = t.bought.as_mut_ptr();
         let (row_session, row_event, row_revenue, row_category) =
             (t.row_session.as_mut_ptr(), t.row_event.as_mut_ptr(), t.row_revenue.as_mut_ptr(), t.row_category.as_mut_ptr());
         let (run_session, run_row, run_name) = (t.run_session.as_mut_ptr(), t.run_row.as_mut_ptr(), t.run_name.as_mut_ptr());
 
-        let (mut sessions, mut broken, mut purchases) = (0usize, 0usize, 0usize);
-        let (mut last_who, mut last_ts) = (u32::MAX, 0u32);
-        for at in 0..count {
-            let (user, event) = (*who.add(at), *events.add(at));
-            let ts = (event >> 32) as u32;
-            let new = (user ^ last_who) >> ALIAS_BITS != 0;
-            let apart = ts.wrapping_sub(last_ts) > GAP as u32;
-            let back = ts < last_ts;
-            *first.add(sessions) = at as u32 | u32::from(new) << 31;
-            *start.add(sessions) = ts;
-            sessions += usize::from(new | apart);
-            *breaks.add(broken) = at as u32 | u32::from(back) << 31;
-            broken += usize::from(!new & (back | (user != last_who)));
-            *bought.add(purchases) = at as u32;
-            *bought_in.add(purchases) = sessions as u32 - 1;
-            purchases += usize::from(event as u32 != 0);
-            last_who = user;
-            last_ts = ts;
+        let (count, foreign) = pack(best, marked, who, ts, slots, t.buys.as_mut_ptr());
+        if foreign {
+            self.foreign_events(marked);
         }
+        step(&mut clock, 1);
+        if count == 0 {
+            self.table = table;
+            return;
+        }
+        let (sessions, purchases, back) = sessions_of(who, ts, count, t.buys.as_ptr(), first, start, bought);
         *first.add(sessions) = count as u32 | TOP;
-        *breaks.add(broken) = LOW;
 
         step(&mut clock, 2);
         let (mut rows, mut runs) = (0usize, 0usize);
@@ -876,30 +995,34 @@ impl<'a> Local<'a> {
         std::ptr::write_bytes(row_category, NO_CATEGORY, rows);
 
         step(&mut clock, 3);
-        let mut next_break = 0;
         for run in 0..runs {
             let (from, to) = (*run_session.add(run) as usize, *run_session.add(run + 1) as usize);
             let (a, e) = ((*first.add(from) & LOW) as usize, (*first.add(to) & LOW) as usize);
-            let user = *who.add(a) >> ALIAS_BITS;
-            let (mut mixed, mut back) = (false, 0);
-            while ((*breaks.add(next_break) & LOW) as usize) < e {
-                mixed = true;
-                back |= *breaks.add(next_break) >> 31;
-                next_break += 1;
-            }
+            let events = e - a;
+            let id = *who.add(a);
+            let user = id >> ALIAS_BITS;
+            let unsorted = back && (a + 1..e).any(|at| *ts.add(at) < *ts.add(at - 1));
             let mut name = NONE;
             let mut inner = if PROFILE { std::arch::x86_64::_rdtsc() } else { 0 };
             if run == 0 || run + 1 == runs {
-                self.edge(part as u32 * 2 + u32::from(run > 0), user, a, e);
+                let edges = &mut self.edges;
+                edges.runs.push((part as u32 * 2 + u32::from(run > 0), user, edges.who.len(), events));
+                gather(best, who, ts, slots, a, e, &mut edges.who, &mut edges.events);
                 step(&mut inner, 10);
-            } else if back != 0 {
-                self.run(user as usize, a, e);
+            } else if unsorted {
+                self.who.clear();
+                self.events.clear();
+                gather(best, who, ts, slots, a, e, &mut self.who, &mut self.events);
+                self.run(user as usize, 0, events);
                 step(&mut inner, 11);
             } else {
-                name = self.claim(user as usize, a, e, mixed);
+                name = self.claim(user as usize, id, aliases(who, a, e));
                 step(&mut inner, 12);
                 if name == NONE {
-                    self.side(user as usize, a, e);
+                    self.who.clear();
+                    self.events.clear();
+                    gather(best, who, ts, slots, a, e, &mut self.who, &mut self.events);
+                    self.side(user as usize, 0, events);
                     step(&mut inner, 13);
                 } else if *stage.starts.0.add(user as usize) != *stage.starts.0.add(user as usize + 1) {
                     self.credit(user as usize, t, from, to);
@@ -927,9 +1050,9 @@ impl<'a> Local<'a> {
         let mut sum_row = [u32::MAX; 32];
         let (mut last_session, mut last_row, mut top) = (u32::MAX, u32::MAX, 0i64);
         for at in 0..purchases {
-            let payload = *events.add(*bought.add(at) as usize) as u32;
+            let payload = (*best.add(*slots.add(*bought.add(at) as u32 as usize) as usize)).b as u32 & 0x1FFF_FFFF;
             let (category, price) = ((payload >> 24) as usize, i64::from(payload & 0x00FF_FFFF));
-            let session = *bought_in.add(at);
+            let session = (*bought.add(at) >> 32) as u32;
             let cell = bought_by.add((*campaign_of.add(session as usize) * days + *day_of.add(session as usize)) as usize);
             (*cell)[0] += i64::from(session != last_session);
             (*cell)[1] += price;
@@ -994,11 +1117,17 @@ impl<'a> Local<'a> {
         step(&mut clock, 9);
     }
 
-    unsafe fn edge(&mut self, place: u32, user: u32, from: usize, to: usize) {
-        let edges = &mut self.edges;
-        edges.runs.push((place, user, edges.who.len(), to - from));
-        edges.who.extend_from_slice(std::slice::from_raw_parts(self.who.as_ptr().add(from), to - from));
-        edges.events.extend_from_slice(std::slice::from_raw_parts(self.events.as_ptr().add(from), to - from));
+    #[cold]
+    #[inline(never)]
+    unsafe fn foreign_events(&mut self, marked: u64) {
+        for low in 0..BUCKET {
+            let record = self.best[low];
+            let stamp = record.a >> 32 & INVALID;
+            if record.b >> 50 == marked && stamp != INVALID && record.a as u32 & FOREIGN != 0 {
+                let person = self.stage.person(record.a as u32);
+                self.side_event(person, stamp << 32 | record.b & 0x1FFF_FFFF);
+            }
+        }
     }
 
     unsafe fn job(&mut self, job: &Job, edges: &[Edges]) {
@@ -1013,7 +1142,11 @@ impl<'a> Local<'a> {
 
     #[inline(never)]
     unsafe fn run(&mut self, user: usize, from: usize, to: usize) {
-        let name = self.claim(user, from, to, true);
+        let mut used = 0;
+        for at in from..to {
+            used |= 1 << (*self.who.get_unchecked(at) & 511).min(8);
+        }
+        let name = self.claim(user, *self.who.get_unchecked(from), used);
         if name == NONE {
             return self.side(user, from, to);
         }
@@ -1058,27 +1191,19 @@ impl<'a> Local<'a> {
     }
 
     #[inline(always)]
-    unsafe fn claim(&mut self, user: usize, from: usize, to: usize, mixed: bool) -> u64 {
+    unsafe fn claim(&mut self, user: usize, first: u32, used: u32) -> u64 {
         let stage = self.stage;
         let shared = stage.shared;
         if shared.state.get_unchecked(user).load(Relaxed) & (LINKED_OUT | ODD) != 0 {
             return NONE;
         }
-        let used = |who: u32| 1u32 << (who & 511).min(8);
-        let first = *self.who.get_unchecked(from);
-        let mut seen = used(first);
-        if mixed {
-            for at in from + 1..to {
-                seen |= used(*self.who.get_unchecked(at));
-            }
-        }
-        let clicks = stage.clicks_of(user);
-        for click in clicks {
-            seen |= used(click.a as u32);
+        let mut used = used & 511;
+        for click in stage.clicks_of(user) {
+            used |= 1 << (click.a as u32 & 511).min(8);
         }
         let mut name = u64::from(first);
-        if seen & (seen - 1) != 0 || shared.adjacent.get_unchecked(user).load(Relaxed) != 0 || seen >> 8 != 0 {
-            name = self.person(user, from, to, seen);
+        if used & (used - 1) != 0 || shared.adjacent.get_unchecked(user).load(Relaxed) != 0 || used >> 8 != 0 {
+            name = self.person(user, first, used);
             if name == NONE {
                 return NONE;
             }
@@ -1090,15 +1215,13 @@ impl<'a> Local<'a> {
     }
 
     #[inline(never)]
-    unsafe fn person(&mut self, user: usize, from: usize, to: usize, seen: u32) -> u64 {
+    unsafe fn person(&mut self, user: usize, first: u32, used: u32) -> u64 {
         let shared = self.stage.shared;
-        let first = *self.who.get_unchecked(from);
-        if seen >> 8 != 0 {
-            let alone = (from..to).all(|at| *self.who.get_unchecked(at) == first) && self.stage.clicks_of(user).iter().all(|click| click.a as u32 == first);
-            return if alone { u64::from(first) } else { NONE };
+        if used >> 8 != 0 {
+            return NONE;
         }
         let component = u32::from(shared.component(user, first & 511));
-        if seen & !component != 0 && seen & (seen - 1) != 0 {
+        if used & !component != 0 && used & (used - 1) != 0 {
             return NONE;
         }
         if component != 0 {
@@ -1794,9 +1917,9 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
     let (next, next_large) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let large = std::sync::Mutex::new(Vec::new());
     let barrier = Barrier::new(threads);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
+    {
+        {
+            pool::run(threads, |_| {
                 let (mut counts, mut keys, mut copy) = (Vec::new(), Vec::new(), Vec::new());
                 loop {
                     let part = next.fetch_add(1, Relaxed);
@@ -1812,7 +1935,7 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                 }
             });
         }
-    });
+       }
     lap("dense: clicks grouped");
 
     let campaigns = context.campaign_ids.len();
@@ -1835,6 +1958,7 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                 bought: vec![[0; 2]; (campaigns + 2) * context.days],
                 table: Table::default(),
                 best: Vec::new(),
+                mark: MARKS + 1,
                 who: Vec::new(),
                 events: Vec::new(),
                 sorted: Vec::new(),
@@ -1857,7 +1981,7 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
         {
             let next = &next;
             pool::each(&mut locals, move |_, local| unsafe {
-                local.best = vec![EMPTY; BUCKET];
+                local.best = vec![UNUSED; BUCKET];
                 local.table = Table::new();
                 loop {
                     let part = next.fetch_add(1, Relaxed);
@@ -1896,7 +2020,7 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                     }
                     local.write_file();
                     barrier.wait();
-                    const STEP: usize = 1 << USER_BITS;
+                    const STEP: usize = 1 << 12;
                     loop {
                         let from = next_users.fetch_add(1, Relaxed) * STEP;
                         if from >= users {
