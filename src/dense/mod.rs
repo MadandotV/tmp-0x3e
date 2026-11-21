@@ -1,6 +1,8 @@
 
 mod codec;
 mod lines;
+mod rows;
+mod sink;
 mod stamp;
 #[cfg(test)]
 mod tests;
@@ -14,7 +16,8 @@ use std::sync::Barrier;
 use std::time::Instant;
 
 use super::mem::{Arena, Scatter};
-use super::pqw::{self, Column};
+use super::pool;
+use super::pqw::{self, Column, Mode};
 use super::scan::{self, Buffer, Field, Input};
 use super::{
     build_links, csv_files, keys, load_context, number, Calendar, Ck, Clicks, Context, Ev, Events,
@@ -72,12 +75,13 @@ struct Shared<'a> {
     context: &'a Context,
     plan: Plan,
     ingest_start: i64,
+    frame: sink::Frame,
     state: &'static [AtomicU8],
     adjacent: &'static [AtomicU64],
 }
 
 fn zeros<T>(count: usize) -> &'static [T] {
-    unsafe { std::slice::from_raw_parts(super::mem::zeroed(count * std::mem::size_of::<T>(), false) as *const T, count) }
+    unsafe { std::slice::from_raw_parts(super::mem::shared(count * std::mem::size_of::<T>()) as *const T, count) }
 }
 
 struct Raw<T>(*mut T);
@@ -411,53 +415,98 @@ impl<'a> Parser<'a> {
 
 impl lines::Events for Parser<'_> {
     #[inline(always)]
-    fn calendar(&mut self) -> &mut Calendar {
-        &mut self.calendar
-    }
-
-    #[inline(always)]
     unsafe fn plain(&mut self, fields: &[Field; 7]) {
         PLAIN.fetch_add(1, Relaxed);
         self.event_line(fields);
     }
 
     #[inline(always)]
-    unsafe fn fused(&mut self, line: &lines::Fused) {
+    unsafe fn rows(&mut self, rows: &rows::Rows, count: usize) {
+        let frame = &self.shared.frame;
+        let mut records = [EMPTY; rows::BATCH];
+        let mut buckets = [0u64; rows::BATCH];
+        let mut left = 0u64;
+        let whole = count & !3;
+        let mut at = 0;
+        while at < whole {
+            let some = frame.four(rows.ids.as_ptr().add(at), rows.times.as_ptr().add(at), rows.lines.as_ptr().add(at), records.as_mut_ptr().add(at), buckets.as_mut_ptr().add(at));
+            left |= u64::from(some) << at;
+            at += 4;
+        }
+        for at in 0..whole {
+            self.events.push(*buckets.get_unchecked(at) as usize, *records.get_unchecked(at));
+        }
+        while left != 0 {
+            self.row(rows, left.trailing_zeros() as usize);
+            left &= left - 1;
+        }
+        for at in whole..count {
+            self.row(rows, at);
+        }
+    }
+}
+
+impl lines::Clicks for Parser<'_> {
+    #[inline(always)]
+    unsafe fn plain_click(&mut self, fields: &[Field; 4]) {
+        self.click_line(fields);
+    }
+
+    #[inline(always)]
+    unsafe fn clicks(&mut self, rows: &[rows::Click]) {
         let shared = self.shared;
         let context = shared.context;
-        let seconds = line.ingest.wrapping_sub(shared.ingest_start) as u64;
-        if seconds >= (1 << INGEST_BITS) - 1 {
-            return bail();
-        }
-        let mut stamp = INVALID;
-        let mut payload = 0u32;
-        let mut who = 0u32;
-        'valid: {
-            if line.ts < context.window_start || line.ts >= context.window_end || line.ingest * 1000 - line.ts > DAY {
-                break 'valid;
+        let user_key = shared.plan.user_key;
+        let user_bound = (shared.plan.users as u64) << ALIAS_BITS;
+        let (campaigns, known) = (context.campaign_by_number.as_ptr(), context.campaign_by_number.len() as u64);
+        for row in rows {
+            let dense = unscramble(row.who, user_key);
+            if (row.campaign >= known) | (dense >= user_bound) {
+                self.click_again(row.line);
+                continue;
             }
-            if line.purchase {
-                match number(line.price.0, line.price.1) {
-                    Some(value) if (1..=10_000_000).contains(&value) => {
-                        payload = u32::from(context.category(line.product.0, line.product.1)) << 24 | value as u32;
-                    }
-                    _ => break 'valid,
-                }
+            let campaign = *campaigns.add(row.campaign as usize);
+            if (campaign == NO_CAMPAIGN) | (row.ts < context.click_start) | (row.ts >= context.window_end) {
+                continue;
             }
-            stamp = (line.ts - context.window_start) as u64;
-            let dense = unscramble(line.who, shared.plan.user_key);
-            who = if dense < (shared.plan.users as u64) << ALIAS_BITS { dense as u32 } else { self.foreign(line.user.0, line.user.1) };
+            let stamp = (row.ts - context.click_start) as u64;
+            let record = Rec { a: dense | stamp << 32, b: row.id | u64::from(campaign) << 40 };
+            self.clicks.push((dense >> (ALIAS_BITS + USER_BITS)) as usize, record);
         }
-        let index = unscramble(line.event, shared.plan.event_key);
-        if index < shared.plan.event_bound {
-            let low = index & (BUCKET as u64 - 1);
-            let record = Rec {
-                a: u64::from(who) | stamp << 32 | (low >> 14) << 63,
-                b: u64::from(payload) | (seconds + 1) << 29 | (low & 0x3FFF) << 50,
-            };
-            self.events.push((index >> BUCKET_BITS) as usize, record);
+    }
+}
+
+impl Parser<'_> {
+    #[cold]
+    #[inline(never)]
+    unsafe fn click_again(&mut self, line: *const u8) {
+        if let (_, Some(fields)) = lines::split_click(line) {
+            self.click_line(&fields);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    unsafe fn row(&mut self, rows: &rows::Rows, at: usize) {
+        let ([event, who], [ts, ingest]) = (rows.ids[at], rows.times[at]);
+        let line = (rows.lines[at] & !rows::PURCHASE) as *const u8;
+        let (_, Some(fields)) = lines::split(line) else { return };
+        let payload = if rows.lines[at] & rows::PURCHASE == 0 {
+            Some(0)
         } else {
-            self.odd_event(line.id.0, line.id.1, seconds, stamp, payload, who);
+            match number(fields[6].0, fields[6].1) {
+                Some(value) if (1..=10_000_000).contains(&value) => Some(u32::from(self.shared.context.category(fields[5].0, fields[5].1)) << 24 | value as u32),
+                _ => None,
+            }
+        };
+        match self.shared.frame.one(event, who, ts, ingest, payload) {
+            Some((bucket, record)) => {
+                self.events.push(bucket, record);
+            }
+            None => {
+                PLAIN.fetch_add(1, Relaxed);
+                self.event_line(&fields);
+            }
         }
     }
 }
@@ -547,11 +596,16 @@ struct Local<'a> {
     columns: Vec<Column>,
     tallies: Vec<Tally>,
     assisted: Vec<u32>,
+    categories: Vec<u8>,
+    credited: Vec<u32>,
+    bought: Vec<[i64; 2]>,
+    table: Table,
     best: Vec<Rec>,
     who: Vec<u32>,
     events: Vec<u64>,
     sorted: Vec<u64>,
-    order: Vec<u64>,
+    assists: Vec<u32>,
+    before: Vec<DayCounts>,
     edges: Edges,
     active: Vec<u32>,
     active_count: Vec<u32>,
@@ -565,10 +619,105 @@ struct Local<'a> {
 
 unsafe impl Send for Local<'_> {}
 
+const FILE_ROWS: usize = 1 << 16;
+const NO_CATEGORY: u8 = 255;
+
+#[derive(Clone, Copy)]
+#[repr(align(32))]
+struct DayCounts([u16; 16]);
+
+const PROFILE: bool = option_env!("NB_PROF").is_some();
+const STEPS: [&str; 15] =
+    ["dedup", "pack", "sessions", "days", "users", "credit", "purchases", "names", "rows", "file", "u:edge", "u:unsorted", "u:claim", "u:side", "u:clicks"];
+static CYCLES: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+static COUNTS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+
+thread_local! {
+    static STEP: std::cell::Cell<[(u64, u64); 15]> = const { std::cell::Cell::new([(0, 0); 15]) };
+}
+
+#[inline(always)]
+fn step(clock: &mut u64, which: usize) {
+    if PROFILE {
+        let now = unsafe { std::arch::x86_64::_rdtsc() };
+        STEP.with(|cell| {
+            let mut steps = cell.get();
+            steps[which].0 += now - *clock;
+            steps[which].1 += 1;
+            cell.set(steps);
+        });
+        *clock = unsafe { std::arch::x86_64::_rdtsc() };
+    }
+}
+
+fn steps_done() {
+    if PROFILE {
+        for (which, (cycles, count)) in STEP.get().into_iter().enumerate() {
+            CYCLES[which].fetch_add(cycles, Relaxed);
+            COUNTS[which].fetch_add(count, Relaxed);
+        }
+    }
+}
+
+const TOP: u32 = 1 << 31;
+const LOW: u32 = TOP - 1;
+
+#[derive(Default)]
+struct Table {
+    first: Vec<u32>,
+    start: Vec<u32>,
+    day: Vec<u32>,
+    campaign: Vec<u32>,
+    row: Vec<u32>,
+    breaks: Vec<u32>,
+    bought: Vec<u32>,
+    bought_in: Vec<u32>,
+    row_session: Vec<u32>,
+    row_event: Vec<u32>,
+    row_revenue: Vec<i64>,
+    row_category: Vec<u8>,
+    run_session: Vec<u32>,
+    run_row: Vec<u32>,
+    run_name: Vec<u64>,
+}
+
+impl Table {
+    fn new() -> Table {
+        let size = BUCKET + 16;
+        Table {
+            first: vec![0; size],
+            start: vec![0; size],
+            day: vec![0; size],
+            campaign: vec![0; size],
+            row: vec![0; size],
+            breaks: vec![0; size],
+            bought: vec![0; size],
+            bought_in: vec![0; size],
+            row_session: vec![0; size],
+            row_event: vec![0; size],
+            row_revenue: vec![0; size],
+            row_category: vec![0; size],
+            run_session: vec![0; size],
+            run_row: vec![0; size],
+            run_name: vec![0; size],
+        }
+    }
+}
+
 impl<'a> Local<'a> {
     fn write_file(&mut self) {
         if self.rows == 0 {
             return;
+        }
+        let column = &mut self.columns[5];
+        column.present.clear();
+        column.present.resize(self.rows.div_ceil(8), 0);
+        column.values.clear();
+        for (row, &category) in self.categories.iter().enumerate() {
+            if category != NO_CATEGORY {
+                column.present[row / 8] |= 1 << (row % 8);
+                column.values.push(category);
+            }
         }
         let name = format!("dense-{}-{}.parquet", self.thread, self.files);
         pqw::write(&self.output.join(concat!("use", "r_d", "ail", "y")).join(name), &T_ONE, &self.columns, self.rows).unwrap();
@@ -576,16 +725,27 @@ impl<'a> Local<'a> {
         self.rows = 0;
         for column in &mut self.columns {
             column.values.clear();
-            column.present.clear();
         }
+        self.categories.clear();
+        self.columns[0].dictionary.clear();
+        self.columns[0].dictionary_len = 0;
     }
 
     #[inline(always)]
-    fn emit(&mut self, name: &[u8], row: &Row) {
-        let context = self.stage.shared.context;
-        self.columns[0].push_str(name);
-        self.columns[1].push_i32(context.first_day + row.day as i32);
-        self.columns[2].push_i32(row.sessions as i32);
+    fn name(&mut self, id: u64) -> usize {
+        let mut text = [0u8; 16];
+        let len = encode(b'u', scramble(id, self.stage.shared.plan.user_key), &mut text);
+        let column = &mut self.columns[0];
+        column.dictionary.extend_from_slice(&(len as u32).to_le_bytes());
+        column.dictionary.extend_from_slice(&text[..len]);
+        column.dictionary_len += 1;
+        column.dictionary_len - 1
+    }
+
+    #[inline(always)]
+    fn emit(&mut self, row: &Row) {
+        self.columns[1].values.push(row.day as u8);
+        self.columns[2].values.push(row.sessions as u8);
         self.columns[3].push_i32(row.events as i32);
         self.columns[4].push_i64(row.revenue);
         let mut top = u32::MAX;
@@ -598,14 +758,8 @@ impl<'a> Local<'a> {
             }
         }
         self.category_used.clear();
-        self.columns[5].push_present(self.rows, top != u32::MAX);
-        if top != u32::MAX {
-            self.columns[5].push_str(&context.categories[top as usize]);
-        }
+        self.categories.push(top as u8);
         self.rows += 1;
-        if self.rows >= 1 << 20 {
-            self.write_file();
-        }
     }
 
     #[inline(always)]
@@ -623,6 +777,7 @@ impl<'a> Local<'a> {
     unsafe fn bucket(&mut self, part: usize) {
         let stage = self.stage;
         let best = self.best.as_mut_ptr();
+        let mut clock = if PROFILE { std::arch::x86_64::_rdtsc() } else { 0 };
         for thread in stage.parsed {
             thread.events.for_each_chunk(part, |chunk| {
                 for record in chunk {
@@ -635,48 +790,208 @@ impl<'a> Local<'a> {
                 }
             });
         }
+        step(&mut clock, 0);
         self.who.clear();
         self.events.clear();
-        self.who.reserve(BUCKET);
-        self.events.reserve(BUCKET);
-        let (who_out, event_out) = (self.who.as_mut_ptr(), self.events.as_mut_ptr());
+        self.who.reserve(BUCKET + 1);
+        self.events.reserve(BUCKET + 1);
+        let (who, events) = (self.who.as_mut_ptr(), self.events.as_mut_ptr());
         let mut count = 0;
-        let (mut from, mut user, mut runs) = (0, u32::MAX, 0u32);
         for low in 0..BUCKET {
             let record = *best.add(low);
-            if record.b == 0 {
-                continue;
-            }
             *best.add(low) = EMPTY;
             let stamp = record.a >> 32 & INVALID;
-            if stamp == INVALID {
-                continue;
-            }
-            let (who, event) = (record.a as u32, stamp << 32 | record.b & 0x1FFF_FFFF);
-            if who & FOREIGN != 0 {
-                let person = stage.person(who);
+            let keep = record.b != 0 && stamp != INVALID;
+            let (user, event) = (record.a as u32, stamp << 32 | record.b & 0x1FFF_FFFF);
+            if u32::from(keep) & user >> 31 != 0 {
+                let person = stage.person(user);
                 self.side_event(person, event);
                 continue;
             }
-            if who >> ALIAS_BITS != user {
-                if count > from {
-                    if runs == 0 {
-                        self.edge(part as u32 * 2, user, from, count);
-                    } else {
-                        self.run(user as usize, from, count);
-                    }
-                    runs += 1;
-                }
-                from = count;
-                user = who >> ALIAS_BITS;
+            *who.add(count) = user;
+            *events.add(count) = event;
+            count += usize::from(keep);
+        }
+        step(&mut clock, 1);
+        if count == 0 {
+            return;
+        }
+        let context = stage.shared.context;
+        let days = context.days as u32;
+        let organic = context.campaign_ids.len() as u32;
+        let unfinished = organic + 1;
+        let mut table = std::mem::take(&mut self.table);
+        let t = &mut table;
+        let (first, start, day_of, campaign_of, row_of) =
+            (t.first.as_mut_ptr(), t.start.as_mut_ptr(), t.day.as_mut_ptr(), t.campaign.as_mut_ptr(), t.row.as_mut_ptr());
+        let (breaks, bought, bought_in) = (t.breaks.as_mut_ptr(), t.bought.as_mut_ptr(), t.bought_in.as_mut_ptr());
+        let (row_session, row_event, row_revenue, row_category) =
+            (t.row_session.as_mut_ptr(), t.row_event.as_mut_ptr(), t.row_revenue.as_mut_ptr(), t.row_category.as_mut_ptr());
+        let (run_session, run_row, run_name) = (t.run_session.as_mut_ptr(), t.run_row.as_mut_ptr(), t.run_name.as_mut_ptr());
+
+        let (mut sessions, mut broken, mut purchases) = (0usize, 0usize, 0usize);
+        let (mut last_who, mut last_ts) = (u32::MAX, 0u32);
+        for at in 0..count {
+            let (user, event) = (*who.add(at), *events.add(at));
+            let ts = (event >> 32) as u32;
+            let new = (user ^ last_who) >> ALIAS_BITS != 0;
+            let apart = ts.wrapping_sub(last_ts) > GAP as u32;
+            let back = ts < last_ts;
+            *first.add(sessions) = at as u32 | u32::from(new) << 31;
+            *start.add(sessions) = ts;
+            sessions += usize::from(new | apart);
+            *breaks.add(broken) = at as u32 | u32::from(back) << 31;
+            broken += usize::from(!new & (back | (user != last_who)));
+            *bought.add(purchases) = at as u32;
+            *bought_in.add(purchases) = sessions as u32 - 1;
+            purchases += usize::from(event as u32 != 0);
+            last_who = user;
+            last_ts = ts;
+        }
+        *first.add(sessions) = count as u32 | TOP;
+        *breaks.add(broken) = LOW;
+
+        step(&mut clock, 2);
+        let (mut rows, mut runs) = (0usize, 0usize);
+        let mut last_day = u32::MAX;
+        for session in 0..sessions {
+            let head = *first.add(session);
+            let day = ((context.day_offset + u64::from(*start.add(session))) / DAY as u64) as u32;
+            *day_of.add(session) = day;
+            *campaign_of.add(session) = organic;
+            *run_session.add(runs) = session as u32;
+            *run_row.add(runs) = rows as u32;
+            runs += (head >> 31) as usize;
+            *row_session.add(rows) = session as u32;
+            *row_event.add(rows) = head & LOW;
+            rows += (head >> 31 | u32::from(day != last_day)) as usize;
+            *row_of.add(session) = rows as u32 - 1;
+            last_day = day;
+        }
+        *run_session.add(runs) = sessions as u32;
+        *run_row.add(runs) = rows as u32;
+        *row_session.add(rows) = sessions as u32;
+        *row_event.add(rows) = count as u32;
+        std::ptr::write_bytes(row_revenue, 0, rows);
+        std::ptr::write_bytes(row_category, NO_CATEGORY, rows);
+
+        step(&mut clock, 3);
+        let mut next_break = 0;
+        for run in 0..runs {
+            let (from, to) = (*run_session.add(run) as usize, *run_session.add(run + 1) as usize);
+            let (a, e) = ((*first.add(from) & LOW) as usize, (*first.add(to) & LOW) as usize);
+            let user = *who.add(a) >> ALIAS_BITS;
+            let (mut mixed, mut back) = (false, 0);
+            while ((*breaks.add(next_break) & LOW) as usize) < e {
+                mixed = true;
+                back |= *breaks.add(next_break) >> 31;
+                next_break += 1;
             }
-            *who_out.add(count) = who;
-            *event_out.add(count) = event;
-            count += 1;
+            let mut name = NONE;
+            let mut inner = if PROFILE { std::arch::x86_64::_rdtsc() } else { 0 };
+            if run == 0 || run + 1 == runs {
+                self.edge(part as u32 * 2 + u32::from(run > 0), user, a, e);
+                step(&mut inner, 10);
+            } else if back != 0 {
+                self.run(user as usize, a, e);
+                step(&mut inner, 11);
+            } else {
+                name = self.claim(user as usize, a, e, mixed);
+                step(&mut inner, 12);
+                if name == NONE {
+                    self.side(user as usize, a, e);
+                    step(&mut inner, 13);
+                } else if *stage.starts.0.add(user as usize) != *stage.starts.0.add(user as usize + 1) {
+                    self.credit(user as usize, t, from, to);
+                    step(&mut inner, 14);
+                }
+            }
+            *run_name.add(run) = name;
+            if name == NONE {
+                for session in from..to {
+                    *campaign_of.add(session) = unfinished;
+                }
+            }
         }
-        if count > from {
-            self.edge(part as u32 * 2 + u32::from(runs > 0), user, from, count);
+
+        step(&mut clock, 4);
+        self.flush_assists();
+        let credited = self.credited.as_mut_ptr();
+        for session in 0..sessions {
+            *credited.add((*campaign_of.add(session) * days + *day_of.add(session)) as usize) += 1;
         }
+
+        step(&mut clock, 5);
+        let bought_by = self.bought.as_mut_ptr();
+        let mut sums = [0i64; 32];
+        let mut sum_row = [u32::MAX; 32];
+        let (mut last_session, mut last_row, mut top) = (u32::MAX, u32::MAX, 0i64);
+        for at in 0..purchases {
+            let payload = *events.add(*bought.add(at) as usize) as u32;
+            let (category, price) = ((payload >> 24) as usize, i64::from(payload & 0x00FF_FFFF));
+            let session = *bought_in.add(at);
+            let cell = bought_by.add((*campaign_of.add(session as usize) * days + *day_of.add(session as usize)) as usize);
+            (*cell)[0] += i64::from(session != last_session);
+            (*cell)[1] += price;
+            last_session = session;
+            let row = *row_of.add(session as usize);
+            let sum = if sum_row[category] == row { sums[category] } else { 0 } + price;
+            sums[category] = sum;
+            sum_row[category] = row;
+            if row != last_row {
+                top = 0;
+            }
+            last_row = row;
+            top = top.max(sum << 5 | (31 - category as i64));
+            *row_revenue.add(row as usize) += price;
+            *row_category.add(row as usize) = 31 - (top & 31) as u8;
+        }
+
+        step(&mut clock, 6);
+        for run in 0..runs {
+            let name = *run_name.add(run);
+            if name != NONE {
+                let place = self.name(name);
+                self.columns[0].push_run((*run_row.add(run + 1) - *run_row.add(run)) as usize, place);
+            }
+        }
+        step(&mut clock, 7);
+        let had = self.rows;
+        self.columns[1].values.reserve(rows);
+        self.columns[2].values.reserve(rows);
+        self.columns[3].values.reserve(rows * 4);
+        self.columns[4].values.reserve(rows * 8);
+        self.categories.reserve(rows);
+        let (day_out, sessions_out, events_out, revenue_out, category_out) = (
+            self.columns[1].values.as_mut_ptr().add(had),
+            self.columns[2].values.as_mut_ptr().add(had),
+            self.columns[3].values.as_mut_ptr().add(had * 4) as *mut u32,
+            self.columns[4].values.as_mut_ptr().add(had * 8) as *mut i64,
+            self.categories.as_mut_ptr().add(had),
+        );
+        let mut kept = 0;
+        for row in 0..rows {
+            let session = *row_session.add(row) as usize;
+            *day_out.add(kept) = *day_of.add(session) as u8;
+            *sessions_out.add(kept) = (*row_session.add(row + 1) - session as u32) as u8;
+            events_out.add(kept).write_unaligned(*row_event.add(row + 1) - *row_event.add(row));
+            revenue_out.add(kept).write_unaligned(*row_revenue.add(row));
+            *category_out.add(kept) = *row_category.add(row);
+            kept += usize::from(*campaign_of.add(session) != unfinished);
+        }
+        let rows = had + kept;
+        self.columns[1].values.set_len(rows);
+        self.columns[2].values.set_len(rows);
+        self.columns[3].values.set_len(rows * 4);
+        self.columns[4].values.set_len(rows * 8);
+        self.categories.set_len(rows);
+        self.rows = rows;
+        self.table = table;
+        step(&mut clock, 8);
+        if self.rows >= FILE_ROWS {
+            self.write_file();
+        }
+        step(&mut clock, 9);
     }
 
     unsafe fn edge(&mut self, place: u32, user: u32, from: usize, to: usize) {
@@ -696,10 +1011,30 @@ impl<'a> Local<'a> {
         self.run(job.user as usize, 0, job.events);
     }
 
-    #[inline(always)]
+    #[inline(never)]
     unsafe fn run(&mut self, user: usize, from: usize, to: usize) {
-        if !self.local(user, from, to) {
-            self.side(user, from, to);
+        let name = self.claim(user, from, to, true);
+        if name == NONE {
+            return self.side(user, from, to);
+        }
+        let mut sorted = true;
+        for at in from + 1..to {
+            sorted &= *self.events.get_unchecked(at - 1) >> 32 <= *self.events.get_unchecked(at) >> 32;
+        }
+        let events: &[u64] = if sorted {
+            std::slice::from_raw_parts(self.events.as_ptr().add(from), to - from)
+        } else {
+            self.sorted.clear();
+            self.sorted.extend_from_slice(std::slice::from_raw_parts(self.events.as_ptr().add(from), to - from));
+            self.sorted.sort_unstable_by_key(|event| event >> 32);
+            std::slice::from_raw_parts(self.sorted.as_ptr(), to - from)
+        };
+        let place = self.name(name);
+        let had = self.rows;
+        self.sessions(events, self.stage.clicks_of(user));
+        self.columns[0].push_run(self.rows - had, place);
+        if self.rows >= FILE_ROWS {
+            self.write_file();
         }
     }
 
@@ -723,65 +1058,238 @@ impl<'a> Local<'a> {
     }
 
     #[inline(always)]
-    unsafe fn local(&mut self, user: usize, from: usize, to: usize) -> bool {
+    unsafe fn claim(&mut self, user: usize, from: usize, to: usize, mixed: bool) -> u64 {
         let stage = self.stage;
         let shared = stage.shared;
         if shared.state.get_unchecked(user).load(Relaxed) & (LINKED_OUT | ODD) != 0 {
-            return false;
+            return NONE;
         }
+        let used = |who: u32| 1u32 << (who & 511).min(8);
         let first = *self.who.get_unchecked(from);
-        let (mut differ, mut sorted) = (0, true);
-        for at in from + 1..to {
-            differ |= *self.who.get_unchecked(at) ^ first;
-            sorted &= *self.events.get_unchecked(at - 1) >> 32 <= *self.events.get_unchecked(at) >> 32;
+        let mut seen = used(first);
+        if mixed {
+            for at in from + 1..to {
+                seen |= used(*self.who.get_unchecked(at));
+            }
         }
         let clicks = stage.clicks_of(user);
-        self.order.clear();
-        for (place, click) in clicks.iter().enumerate() {
-            differ |= click.a as u32 ^ first;
-            self.order.push(click.a >> 32 << 32 | place as u64);
+        for click in clicks {
+            seen |= used(click.a as u32);
         }
         let mut name = u64::from(first);
-        if differ != 0 || shared.adjacent.get_unchecked(user).load(Relaxed) != 0 {
-            let component = u32::from(shared.component(user, first & 511));
-            let same = |who: u32| who == first || ((who & 511) < 8 && component >> (who & 7) & 1 != 0);
-            if differ != 0 && !((from..to).all(|at| same(*self.who.get_unchecked(at))) && clicks.iter().all(|click| same(click.a as u32))) {
-                return false;
-            }
-            if component != 0 {
-                name = shared.smallest(user, component as u8);
+        if seen & (seen - 1) != 0 || shared.adjacent.get_unchecked(user).load(Relaxed) != 0 || seen >> 8 != 0 {
+            name = self.person(user, from, to, seen);
+            if name == NONE {
+                return NONE;
             }
         }
         if shared.state.get_unchecked(user).fetch_or(LOCAL, Relaxed) & (LOCAL | SIDE) != 0 {
             VIOLATION.store(true, Relaxed);
-            return true;
         }
-        let mut text = [0u8; 16];
-        let len = encode(b'u', scramble(name, shared.plan.user_key), &mut text);
-        if self.order.len() > 1 {
-            self.order.sort_unstable();
+        name
+    }
+
+    #[inline(never)]
+    unsafe fn person(&mut self, user: usize, from: usize, to: usize, seen: u32) -> u64 {
+        let shared = self.stage.shared;
+        let first = *self.who.get_unchecked(from);
+        if seen >> 8 != 0 {
+            let alone = (from..to).all(|at| *self.who.get_unchecked(at) == first) && self.stage.clicks_of(user).iter().all(|click| click.a as u32 == first);
+            return if alone { u64::from(first) } else { NONE };
         }
-        let events: &[u64] = if sorted {
-            std::slice::from_raw_parts(self.events.as_ptr().add(from), to - from)
+        let component = u32::from(shared.component(user, first & 511));
+        if seen & !component != 0 && seen & (seen - 1) != 0 {
+            return NONE;
+        }
+        if component != 0 {
+            shared.smallest(user, component as u8)
         } else {
-            self.sorted.clear();
-            self.sorted.extend_from_slice(std::slice::from_raw_parts(self.events.as_ptr().add(from), to - from));
-            self.sorted.sort_unstable_by_key(|event| event >> 32);
-            std::slice::from_raw_parts(self.sorted.as_ptr(), to - from)
-        };
-        self.sessions(&text[..len], events, clicks);
-        true
+            u64::from(first)
+        }
     }
 
     #[inline(always)]
-    unsafe fn sessions(&mut self, name: &[u8], events: &[u64], records: &[Rec]) {
+    unsafe fn credit(&mut self, user: usize, table: &mut Table, from: usize, to: usize) {
+        use std::arch::x86_64::*;
+        let records = self.stage.clicks_of(user);
+        if records.len() > 16 {
+            return self.credit_many(records, table, from, to);
+        }
+        #[repr(align(32))]
+        struct Lanes([u32; 16]);
+        let (mut stamps, mut campaigns, mut earlier) = (Lanes([0; 16]), Lanes([0; 16]), Lanes([0; 16]));
+        for (place, click) in records.iter().enumerate() {
+            stamps.0[place] = (click.a >> 32) as u32;
+            campaigns.0[place] = (click.b >> 40) as u32;
+        }
+        let load = |lanes: &Lanes, half: usize| _mm256_load_si256(lanes.0.as_ptr().add(8 * half) as *const __m256i);
+        let bits = |low: __m256i, high: __m256i| (_mm256_movemask_ps(_mm256_castsi256_ps(low)) | _mm256_movemask_ps(_mm256_castsi256_ps(high)) << 8) as u32;
+        let (stamps_low, stamps_high) = (load(&stamps, 0), load(&stamps, 1));
+        let (campaigns_low, campaigns_high) = (load(&campaigns, 0), load(&campaigns, 1));
+        for place in 0..records.len() {
+            let one = _mm256_set1_epi32(campaigns.0[place] as i32);
+            earlier.0[place] = bits(_mm256_cmpeq_epi32(campaigns_low, one), _mm256_cmpeq_epi32(campaigns_high, one)) & ((1 << place) - 1);
+        }
+        let (earlier_low, earlier_high) = (load(&earlier, 0), load(&earlier, 1));
+        let days = _mm256_set1_epi32(self.stage.shared.context.days as i32);
+        let (cells_low, cells_high) = (_mm256_mullo_epi32(campaigns_low, days), _mm256_mullo_epi32(campaigns_high, days));
+        let valid = (1u32 << records.len()) - 1;
+        let week = _mm256_set1_epi32(WEEK as i32);
+        let mut listed = self.assists.len();
+        if listed + 16 * (to - from) + 16 > self.assists.capacity() {
+            self.flush_assists();
+            self.assists.reserve(16 * (to - from) + 16);
+            listed = 0;
+        }
+        let list = self.assists.as_mut_ptr();
+        for session in from..to {
+            let start = _mm256_set1_epi32(*table.start.get_unchecked(session) as i32);
+            let day = _mm256_set1_epi32(*table.day.get_unchecked(session) as i32);
+            let (after_low, after_high) = (_mm256_sub_epi32(stamps_low, start), _mm256_sub_epi32(stamps_high, start));
+            let inside = bits(
+                _mm256_cmpeq_epi32(_mm256_min_epu32(after_low, week), after_low),
+                _mm256_cmpeq_epi32(_mm256_min_epu32(after_high, week), after_high),
+            ) & valid;
+            let latest = campaigns.0[(31 - (inside | 1).leading_zeros()) as usize & 15];
+            let credited = table.campaign.get_unchecked_mut(session);
+            *credited = if inside != 0 { latest } else { *credited };
+            let lowest = _mm256_set1_epi32((inside & inside.wrapping_neg()) as i32);
+            let counted = inside & bits(_mm256_cmpgt_epi32(lowest, earlier_low), _mm256_cmpgt_epi32(lowest, earlier_high));
+            for (half, cells) in [cells_low, cells_high].into_iter().enumerate() {
+                let mask = u64::from(counted >> (8 * half) & 255);
+                let places = _pext_u64(0x0706_0504_0302_0100, _pdep_u64(mask, 0x0101_0101_0101_0101) * 255);
+                let packed = _mm256_permutevar8x32_epi32(_mm256_add_epi32(cells, day), _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(places as i64)));
+                _mm256_storeu_si256(list.add(listed) as *mut __m256i, packed);
+                listed += mask.count_ones() as usize;
+            }
+        }
+        self.assists.set_len(listed);
+    }
+
+    #[inline(never)]
+    fn flush_assists(&mut self) {
+        for &cell in &self.assists {
+            unsafe { *self.assisted.get_unchecked_mut(cell as usize) += 1 };
+        }
+        self.assists.clear();
+    }
+
+    #[inline(never)]
+    unsafe fn credit_many(&mut self, clicks: &[Rec], table: &mut Table, from: usize, to: usize) {
+        use std::arch::x86_64::*;
+        let days = self.stage.shared.context.days;
+        if days > 16 {
+            return self.credit_slow(clicks, table, from, to);
+        }
+        static ONE_DAY: [DayCounts; 16] = {
+            let mut table = [DayCounts([0; 16]); 16];
+            let mut day = 0;
+            while day < 16 {
+                table[day].0[day] = 1;
+                day += 1;
+            }
+            table
+        };
+        let stamp = |click: &Rec| (click.a >> 32) as u32;
+        let campaign = |click: &Rec| (click.b >> 40) as usize;
+        let count = to - from;
+        let starts = table.start.as_ptr().add(from);
+        self.before.clear();
+        self.before.reserve(count + 1);
+        let before = self.before.as_mut_ptr() as *mut __m256i;
+        let mut sum = _mm256_setzero_si256();
+        _mm256_store_si256(before, sum);
+        let mut high = 0;
+        for session in 0..count {
+            let start = *starts.add(session);
+            sum = _mm256_add_epi16(sum, _mm256_load_si256(ONE_DAY.as_ptr().add(*table.day.get_unchecked(from + session) as usize) as *const __m256i));
+            _mm256_store_si256(before.add(session + 1), sum);
+            while high < clicks.len() && stamp(clicks.get_unchecked(high)) <= start + WEEK as u32 {
+                high += 1;
+            }
+            if high > 0 && stamp(clicks.get_unchecked(high - 1)) >= start {
+                *table.campaign.get_unchecked_mut(from + session) = campaign(clicks.get_unchecked(high - 1)) as u32;
+            }
+        }
+        let reached = self.active_count.as_mut_ptr();
+        let assisted = self.assisted.as_mut_ptr();
+        let (mut low, mut high) = (0, 0);
+        for click in clicks {
+            let at = stamp(click);
+            while high < count && *starts.add(high) <= at {
+                high += 1;
+            }
+            while low < high && *starts.add(low) + (WEEK as u32) < at {
+                low += 1;
+            }
+            let reach = reached.add(campaign(click));
+            let first = low.max(*reach as usize);
+            *reach = high as u32;
+            let more = _mm256_sub_epi16(_mm256_load_si256(before.add(high)), _mm256_load_si256(before.add(first)));
+            let cells = assisted.add(campaign(click) * days) as *mut __m256i;
+            _mm256_storeu_si256(cells, _mm256_add_epi32(_mm256_loadu_si256(cells), _mm256_cvtepu16_epi32(_mm256_castsi256_si128(more))));
+            let cells = cells.add(1);
+            _mm256_storeu_si256(cells, _mm256_add_epi32(_mm256_loadu_si256(cells), _mm256_cvtepu16_epi32(_mm256_extracti128_si256(more, 1))));
+        }
+        for click in clicks {
+            *reached.add(campaign(click)) = 0;
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn credit_slow(&mut self, clicks: &[Rec], table: &mut Table, from: usize, to: usize) {
+        let context = self.stage.shared.context;
+        let days = context.days;
+        let stamp = |click: &Rec| (click.a >> 32) as u32;
+        let campaign = |click: &Rec| (click.b >> 40) as usize;
+        let (mut low, mut high) = (0, 0);
+        for session in from..to {
+            let start = u64::from(*table.start.get_unchecked(session));
+            let day = *table.day.get_unchecked(session) as usize;
+            let reach = (start + WEEK as u64) as u32;
+            while high < clicks.len() && stamp(&clicks[high]) <= reach {
+                let campaign = campaign(&clicks[high]);
+                if self.active_count[campaign] == 0 {
+                    self.active_at[campaign] = self.active.len() as u32;
+                    self.active.push(campaign as u32);
+                }
+                self.active_count[campaign] += 1;
+                high += 1;
+            }
+            while low < high && stamp(&clicks[low]) < start as u32 {
+                let campaign = campaign(&clicks[low]);
+                self.active_count[campaign] -= 1;
+                if self.active_count[campaign] == 0 {
+                    let hole = self.active_at[campaign] as usize;
+                    let moved = self.active.pop().unwrap();
+                    if moved as usize != campaign {
+                        self.active[hole] = moved;
+                        self.active_at[moved as usize] = hole as u32;
+                    }
+                }
+                low += 1;
+            }
+            if low < high {
+                *table.campaign.get_unchecked_mut(session) = campaign(&clicks[high - 1]) as u32;
+            }
+            for &campaign in &self.active {
+                *self.assisted.get_unchecked_mut(campaign as usize * days + day) += 1;
+            }
+        }
+        for &campaign in &self.active {
+            self.active_count[campaign as usize] = 0;
+        }
+        self.active.clear();
+    }
+
+    #[inline(always)]
+    unsafe fn sessions(&mut self, events: &[u64], records: &[Rec]) {
         let context = self.stage.shared.context;
         let days = context.days;
         let organic = context.campaign_ids.len();
-        let clicks = std::slice::from_raw_parts(self.order.as_ptr(), self.order.len());
-        let stamp = |click: u64| (click >> 32) as u32;
-        let record = |click: u64| records.get_unchecked(click as u32 as usize);
-        let campaign = |click: u64| (record(click).b >> 40) as usize;
+        let clicks = records;
+        let stamp = |click: Rec| (click.a >> 32) as u32;
+        let campaign = |click: Rec| (click.b >> 40) as usize;
         let mut row = Row { day: usize::MAX, sessions: 0, events: 0, revenue: 0 };
         let (mut low, mut high) = (0, 0);
         let mut at = 0;
@@ -790,7 +1298,7 @@ impl<'a> Local<'a> {
             let day = ((context.day_offset + start) / DAY as u64) as usize;
             if day != row.day {
                 if row.day != usize::MAX {
-                    self.emit(name, &row);
+                    self.emit(&row);
                 }
                 row = Row { day, sessions: 0, events: 0, revenue: 0 };
             }
@@ -845,15 +1353,7 @@ impl<'a> Local<'a> {
                     low += 1;
                 }
                 if low < high {
-                    let mut chosen = high - 1;
-                    let mut other = chosen;
-                    while other > low && stamp(clicks[other - 1]) == stamp(clicks[chosen]) {
-                        other -= 1;
-                        if codec::order(record(clicks[other]).b & MASK) < codec::order(record(clicks[chosen]).b & MASK) {
-                            chosen = other;
-                        }
-                    }
-                    credited = campaign(clicks[chosen]);
+                    credited = campaign(clicks[high - 1]);
                 }
                 for &campaign in &self.active {
                     *self.assisted.get_unchecked_mut(campaign as usize * days + day) += 1;
@@ -865,7 +1365,7 @@ impl<'a> Local<'a> {
             tally.revenue += revenue;
         }
         if row.day != usize::MAX {
-            self.emit(name, &row);
+            self.emit(&row);
         }
         for &campaign in &self.active {
             self.active_count[campaign as usize] = 0;
@@ -895,7 +1395,17 @@ impl<'a> Local<'a> {
         }
     }
 }
-unsafe fn group_clicks(parsed: &[Parse], part: usize, base: usize, clicks: &Raw<Rec>, starts: &Raw<u32>, counts: &mut Vec<u32>) {
+unsafe fn group_clicks(
+    parsed: &[Parse],
+    part: usize,
+    base: usize,
+    clicks: &Raw<Rec>,
+    starts: &Raw<u32>,
+    counts: &mut Vec<u32>,
+    keys: &mut Vec<u64>,
+    copy: &mut Vec<Rec>,
+    large: &std::sync::Mutex<Vec<(usize, usize)>>,
+) {
     let users = 1usize << USER_BITS;
     let first = part << USER_BITS;
     counts.clear();
@@ -922,6 +1432,105 @@ unsafe fn group_clicks(parsed: &[Parse], part: usize, base: usize, clicks: &Raw<
             }
         });
     }
+    let mut from = base;
+    for &to in counts.iter() {
+        let to = to as usize;
+        if to - from > MANY_CLICKS {
+            large.lock().unwrap().push((from, to));
+        } else if to - from > 1 {
+            sort_clicks(std::slice::from_raw_parts_mut(clicks.0.add(from), to - from), keys, copy);
+        }
+        from = to;
+    }
+}
+
+const MANY_CLICKS: usize = 4096;
+
+fn sort_clicks(clicks: &mut [Rec], keys: &mut Vec<u64>, copy: &mut Vec<Rec>) {
+    let before = |x: &Rec, y: &Rec| {
+        let (at_x, at_y) = (x.a >> 32, y.a >> 32);
+        at_x < at_y || (at_x == at_y && codec::order(x.b & MASK) > codec::order(y.b & MASK))
+    };
+    let insertion = |clicks: &mut [Rec]| {
+        for at in 1..clicks.len() {
+            let click = clicks[at];
+            let mut hole = at;
+            while hole > 0 && before(&click, &clicks[hole - 1]) {
+                clicks[hole] = clicks[hole - 1];
+                hole -= 1;
+            }
+            clicks[hole] = click;
+        }
+    };
+    if clicks.len() <= 32 {
+        use std::arch::x86_64::*;
+        #[repr(align(32))]
+        struct Lanes([u32; 32]);
+        let mut stamps = Lanes([i32::MAX as u32; 32]);
+        let mut copy = [EMPTY; 32];
+        for (place, click) in clicks.iter().enumerate() {
+            stamps.0[place] = (click.a >> 32) as u32;
+            copy[place] = *click;
+        }
+        let groups = clicks.len().div_ceil(8);
+        let mut ties = false;
+        unsafe {
+            let lanes = stamps.0.as_ptr() as *const __m256i;
+            for place in 0..clicks.len() {
+                let one = _mm256_set1_epi32(stamps.0[place] as i32);
+                let (mut earlier, mut same) = (0u32, 0u32);
+                for group in 0..groups {
+                    let stamps = _mm256_load_si256(lanes.add(group));
+                    earlier += (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(one, stamps))) as u32).count_ones();
+                    same |= (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(one, stamps))) as u32) << (8 * group);
+                }
+                same &= (1 << place) - 1;
+                ties |= same != 0 && copy[same.trailing_zeros() as usize].b != copy[place].b;
+                *clicks.get_unchecked_mut((earlier + same.count_ones()) as usize) = copy[place];
+            }
+        }
+        if ties {
+            insertion(clicks);
+        }
+        return;
+    }
+    keys.clear();
+    keys.extend(clicks.iter().enumerate().map(|(place, click)| click.a >> 32 << 32 | place as u64));
+    keys.sort_unstable();
+    copy.clear();
+    copy.extend(keys.iter().map(|&key| clicks[key as u32 as usize]));
+    clicks.copy_from_slice(copy);
+    let mut from = 0;
+    while from < clicks.len() {
+        let mut to = from + 1;
+        while to < clicks.len() && clicks[to].a >> 32 == clicks[from].a >> 32 {
+            to += 1;
+        }
+        if to - from > 1 {
+            insertion(&mut clicks[from..to]);
+        }
+        from = to;
+    }
+}
+
+fn row_columns(context: &Context) -> Vec<Column> {
+    let mut columns: Vec<Column> = (0..6).map(|_| Column::default()).collect();
+    columns[0].mode = Mode::Runs;
+    for (column, values) in [(1, context.days), (2, 256), (5, context.categories.len())] {
+        columns[column].mode = Mode::Bytes;
+        columns[column].dictionary_len = values;
+    }
+    for day in 0..context.days {
+        columns[1].dictionary.extend_from_slice(&(context.first_day + day as i32).to_le_bytes());
+    }
+    for sessions in 0..256i32 {
+        columns[2].dictionary.extend_from_slice(&sessions.to_le_bytes());
+    }
+    for category in &context.categories {
+        columns[5].dictionary.extend_from_slice(&(category.len() as u32).to_le_bytes());
+        columns[5].dictionary.extend_from_slice(category);
+    }
+    columns
 }
 
 fn remove_output(output: &Path) {
@@ -934,12 +1543,24 @@ fn remove_output(output: &Path) {
 }
 
 pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: Instant) -> bool {
+    let first_tick = pool::now_ticks();
     let lap = |what: &str| {
         if verbose {
             let mut cpu = libc::timespec { tv_sec: 0, tv_nsec: 0 };
             unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut cpu) };
             let cpu = cpu.tv_sec as f64 * 1e3 + cpu.tv_nsec as f64 / 1e6;
-            eprintln!("{:>8.1} ms  cpu {cpu:>8.1} ms  {what}", started.elapsed().as_secs_f64() * 1e3);
+            let ticks = (pool::now_ticks() - first_tick).max(1);
+            let alone = started.elapsed().as_secs_f64() * 1e3 * ticks.saturating_sub(pool::staged_ticks()) as f64 / ticks as f64;
+            let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+            unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+            let system = usage.ru_stime.tv_sec as f64 * 1e3 + usage.ru_stime.tv_usec as f64 / 1e3;
+            eprintln!(
+                "{:>8.1} ms  cpu {cpu:>8.1} ms  {what}  (sys {system:.0} ms, {} faults, {} MB peak, {}% idle, {alone:.1} ms alone)",
+                started.elapsed().as_secs_f64() * 1e3,
+                usage.ru_minflt,
+                usage.ru_maxrss >> 10,
+                pool::idle()
+            );
         }
     };
     let refuse = |why: &str| {
@@ -954,28 +1575,48 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
     let link_paths = csv_files(&data.join(concat!("lin", "ks")));
     let click_paths = csv_files(&data.join(concat!("cli", "cks")));
     let event_paths = csv_files(&data.join(concat!("eve", "nts")));
-    let plan = match detect(&link_paths, &event_paths) {
+    enum Ready {
+        Plan(Result<Plan, &'static str>),
+        Context(Option<Context>),
+        Input(Input),
+        Events(lines::Input),
+    }
+    let (links_end, clicks_end) = (2 + link_paths.len(), 2 + link_paths.len() + click_paths.len());
+    let mut ready = pool::fill(threads, clicks_end + event_paths.len(), |task| match task {
+        0 => Ready::Plan(detect(&link_paths, &event_paths)),
+        1 => {
+            fs::create_dir_all(output.join(concat!("use", "r_d", "ail", "y"))).unwrap();
+            fs::create_dir_all(output.join(concat!("cam", "pai", "gn_", "dai", "ly"))).unwrap();
+            Ready::Context(load_context(data))
+        }
+        _ if task < links_end => Ready::Input(scan::open(&link_paths[task - 2])),
+        _ if task < clicks_end => Ready::Input(scan::open(&click_paths[task - links_end])),
+        _ => Ready::Events(lines::open(&event_paths[task - clicks_end])),
+    })
+    .into_iter();
+    let (Some(Ready::Plan(plan)), Some(Ready::Context(context))) = (ready.next(), ready.next()) else { unreachable!() };
+    let mut link_inputs = Vec::new();
+    let mut click_inputs = Vec::new();
+    let mut event_inputs = Vec::new();
+    for (task, ready) in ready.enumerate() {
+        match ready {
+            Ready::Input(input) if task + 2 < links_end => link_inputs.push(input),
+            Ready::Input(input) => click_inputs.push(input),
+            Ready::Events(input) => event_inputs.push(input),
+            _ => unreachable!(),
+        }
+    }
+    let plan = match plan {
         Ok(plan) => plan,
         Err(why) => return refuse(why),
     };
-    let context = {
-        let (data, output) = (data.to_path_buf(), output.to_path_buf());
-        std::thread::spawn(move || {
-            fs::create_dir_all(output.join(concat!("use", "r_d", "ail", "y"))).unwrap();
-            fs::create_dir_all(output.join(concat!("cam", "pai", "gn_", "dai", "ly"))).unwrap();
-            load_context(&data)
-        })
-    };
-    let open_all = |paths: &[PathBuf]| -> Vec<Input> { paths.iter().map(|path| scan::open(path)).collect() };
-    let link_inputs = open_all(&link_paths);
-    let click_inputs = open_all(&click_paths);
-    let event_inputs: Vec<lines::Input> = event_paths.iter().map(|path| lines::open(path)).collect();
+    let click_lines = &click_inputs;
     let event_bytes: u64 = event_inputs.iter().map(lines::Input::len).sum();
-    let click_bytes: u64 = click_inputs.iter().map(Input::len).sum();
+    let click_bytes: u64 = click_lines.iter().map(lines::Input::len).sum();
     lap("dense: keys");
 
-    let Some(mut context) = context.join().unwrap() else { return refuse("no context") };
-    if context.categories.len() > 32 || context.campaign_ids.len() >= 1 << 24 {
+    let Some(mut context) = context else { return refuse("no context") };
+    if context.categories.len() > 32 || context.campaign_ids.len() >= 1 << 24 || context.days > 255 {
         return refuse("too many categories or campaigns");
     }
     let estimate = event_bytes / 80;
@@ -984,23 +1625,34 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
     let context = &context;
     let users = plan.users;
     let buckets = (plan.event_bound >> BUCKET_BITS) as usize;
+    let ingest_start = context.window_start.div_euclid(1000) - INGEST_LEAD;
     let shared = Shared {
         context,
+        frame: sink::Frame {
+            user_key: plan.user_key,
+            event_key: plan.event_key,
+            user_bound: (plan.users as u64) << ALIAS_BITS,
+            event_bound: plan.event_bound,
+            ingest_start,
+            window_start: context.window_start,
+            window_end: context.window_end,
+            spare: buckets as u64,
+        },
         plan,
-        ingest_start: context.window_start.div_euclid(1000) - INGEST_LEAD,
+        ingest_start,
         state: zeros(users),
         adjacent: zeros(users),
     };
     let shared = &shared;
 
-    const CHUNK: usize = 1 << 18;
-    let link_tasks = scan::tasks(&link_inputs, CHUNK);
+    let chunk = super::source::chunk();
+    let link_tasks = scan::tasks(&link_inputs, chunk.min(1 << 18));
     let next = AtomicUsize::new(0);
     let barrier = Barrier::new(threads);
-    let pairs: Vec<Vec<(u64, u64)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                scope.spawn(|| unsafe {
+    let pairs: Vec<Vec<(u64, u64)>> = {
+        {
+            {
+                pool::map(threads, |_| unsafe {
                     let mut general: Vec<(u64, u64)> = Vec::new();
                     let mut inside: Vec<u32> = Vec::new();
                     let mut buffer = Buffer::new();
@@ -1040,10 +1692,9 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                     }
                     general
                 })
-            })
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
-    });
+            }
+        }
+    };
     lap("dense: links parsed");
     let links = build_links(threads, &pairs);
     let links = &links;
@@ -1051,38 +1702,42 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
 
     let record_bytes = (event_bytes / 80 * 16 + click_bytes / 45 * 16) as usize;
     let click_parts = users >> USER_BITS;
-    let click_tasks = scan::tasks(&click_inputs, CHUNK);
-    let event_tasks = lines::tasks(&event_inputs, CHUNK);
+    let click_tasks = lines::tasks(click_lines, chunk);
+    let event_tasks = lines::tasks(&event_inputs, chunk);
     let plain = std::env::var_os("DENSE_PLAIN").is_some();
     let (next_click, next_event) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    let parsed: Vec<Parse> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|thread| {
-                let (click_tasks, event_tasks, click_inputs, event_inputs) = (&click_tasks, &event_tasks, &click_inputs, &event_inputs);
+    let parsed: Vec<Parse> = {
+        {
+            {
+                let (click_tasks, event_tasks, event_inputs) = (&click_tasks, &event_tasks, &event_inputs);
                 let (next_click, next_event) = (&next_click, &next_event);
-                scope.spawn(move || unsafe {
+                pool::map(threads, move |thread| unsafe {
                     let arena = Arena::leak(record_bytes / 4);
                     let mut parser = Parser {
                         shared,
                         thread: thread as u32,
                         calendar: Calendar::new(),
-                        events: Scatter::new(arena, buckets),
+                        events: Scatter::new(arena, buckets + 1),
                         clicks: Scatter::new(arena, click_parts),
                         foreign: Vec::new(),
                         odd_events: Vec::new(),
                         odd_clicks: Vec::new(),
                     };
-                    let mut buffer = Buffer::new();
                     let mut event_buffer = lines::Buffer::new();
+                    let mut batch = lines::Batch::new();
                     while let Some(&task) = event_tasks.get(next_event.fetch_add(1, Relaxed)) {
                         if plain {
                             lines::run_plain(&event_inputs[task.file], task, &mut event_buffer, &mut parser);
                         } else {
-                            lines::run_events(&event_inputs[task.file], task, &mut event_buffer, &mut parser);
+                            lines::run_events(&event_inputs[task.file], task, &mut event_buffer, &mut batch, &mut parser);
                         }
                     }
                     while let Some(&task) = click_tasks.get(next_click.fetch_add(1, Relaxed)) {
-                        scan::run::<4>(&click_inputs[task.file], task, &mut buffer, |fields| parser.click_line(fields));
+                        if plain {
+                            lines::run_plain_clicks(&click_lines[task.file], task, &mut event_buffer, &mut parser);
+                        } else {
+                            lines::run_clicks(&click_lines[task.file], task, &mut event_buffer, &mut batch, &mut parser);
+                        }
                     }
                     parser.events.finish();
                     parser.clicks.finish();
@@ -1094,10 +1749,9 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                         odd_clicks: parser.odd_clicks,
                     }
                 })
-            })
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
-    });
+            }
+        }
+    };
     lap("dense: parsed");
     if verbose {
         eprintln!("dense: {} event lines were read the plain way", PLAIN.load(Relaxed));
@@ -1132,22 +1786,29 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
         shared,
         links,
         parsed,
-        clicks: Raw(super::mem::zeroed(click_total * 16, false) as *mut Rec),
-        starts: Raw(super::mem::zeroed((users + 1) * 4, false) as *mut u32),
+        clicks: Raw(super::mem::shared(click_total * 16) as *mut Rec),
+        starts: Raw(super::mem::shared((users + 1) * 4) as *mut u32),
     };
     unsafe { *stage.starts.0.add(users) = click_total as u32 };
     let stage = &stage;
-    let next = AtomicUsize::new(0);
+    let (next, next_large) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let large = std::sync::Mutex::new(Vec::new());
+    let barrier = Barrier::new(threads);
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut counts = Vec::new();
+                let (mut counts, mut keys, mut copy) = (Vec::new(), Vec::new(), Vec::new());
                 loop {
                     let part = next.fetch_add(1, Relaxed);
                     if part >= click_parts {
                         break;
                     }
-                    unsafe { group_clicks(parsed, part, bases[part], &stage.clicks, &stage.starts, &mut counts) };
+                    unsafe { group_clicks(parsed, part, bases[part], &stage.clicks, &stage.starts, &mut counts, &mut keys, &mut copy, &large) };
+                }
+                barrier.wait();
+                loop {
+                    let Some(&(from, to)) = large.lock().unwrap().get(next_large.fetch_add(1, Relaxed)) else { break };
+                    sort_clicks(unsafe { std::slice::from_raw_parts_mut(stage.clicks.0.add(from), to - from) }, &mut keys, &mut copy);
                 }
             });
         }
@@ -1166,14 +1827,19 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                 thread,
                 files: 0,
                 rows: 0,
-                columns: (0..6).map(|_| Column::default()).collect(),
+                columns: row_columns(context),
                 tallies: vec![Tally::default(); (campaigns + 1) * context.days],
-                assisted: vec![0; (campaigns + 1) * context.days],
+                assisted: vec![0; (campaigns + 1) * context.days + 16],
+                categories: Vec::new(),
+                credited: vec![0; (campaigns + 2) * context.days],
+                bought: vec![[0; 2]; (campaigns + 2) * context.days],
+                table: Table::default(),
                 best: Vec::new(),
                 who: Vec::new(),
                 events: Vec::new(),
                 sorted: Vec::new(),
-                order: Vec::new(),
+                assists: Vec::with_capacity(1 << 12),
+                before: Vec::new(),
                 edges: Edges::default(),
                 active: Vec::new(),
                 active_count: vec![0; campaigns],
@@ -1187,11 +1853,12 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
         })
         .collect();
     let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for local in &mut locals {
+    {
+        {
             let next = &next;
-            scope.spawn(move || unsafe {
+            pool::each(&mut locals, move |_, local| unsafe {
                 local.best = vec![EMPTY; BUCKET];
+                local.table = Table::new();
                 loop {
                     let part = next.fetch_add(1, Relaxed);
                     if part >= buckets {
@@ -1199,22 +1866,30 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                     }
                     local.bucket(part);
                 }
+                steps_done();
             });
         }
-    });
+    }
     lap("dense: buckets");
+    if PROFILE && verbose {
+        for (name, cycles) in STEPS.iter().zip(&CYCLES) {
+            eprintln!("{name:>12} {:>7.1} M cycles", cycles.load(Relaxed) as f64 / 1e6);
+        }
+        for (name, count) in STEPS.iter().zip(&COUNTS).skip(10) {
+            eprintln!("{name:>12} {:>7.1} K cycles", count.load(Relaxed) as f64 / 1e3);
+        }
+    }
 
     let edges: Vec<Edges> = locals.iter_mut().map(|local| std::mem::take(&mut local.edges)).collect();
     let jobs = stitch(&edges);
     let (edges, jobs) = (&edges, &jobs);
     let (next, next_users) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let barrier = Barrier::new(threads);
-    let results: Vec<(Vec<Tally>, Sendable<Parsed>)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = locals
-            .into_iter()
-            .map(|mut local| {
+    let results: Vec<(Vec<Tally>, Sendable<Parsed>)> = {
+        {
+            {
                 let (next, next_users, barrier) = (&next, &next_users, &barrier);
-                scope.spawn(move || unsafe {
+                pool::consume(locals, move |_, mut local: Local| unsafe {
                     let thread = local.thread;
                     while let Some(job) = jobs.get(next.fetch_add(1, Relaxed)) {
                         local.job(job, edges);
@@ -1243,15 +1918,17 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                     local.side_clicks.finish();
                     let arena = local.side_events.arena();
                     let side = Parsed { dedups: Scatter::new(arena, 1), events: local.side_events, clicks: local.side_clicks };
-                    for (tally, &assisted) in local.tallies.iter_mut().zip(&local.assisted) {
-                        tally.assisted += assisted;
+                    for (cell, tally) in local.tallies.iter_mut().enumerate() {
+                        tally.assisted += local.assisted[cell];
+                        tally.sessions += local.credited[cell];
+                        tally.purchasing += local.bought[cell][0] as u32;
+                        tally.revenue += local.bought[cell][1];
                     }
                     (local.tallies, Sendable(side))
                 })
-            })
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
-    });
+            }
+        }
+    };
     lap("dense: sessions");
     if VIOLATION.load(Relaxed) {
         remove_output(output);
@@ -1263,11 +1940,11 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
     let side_events: usize = side.iter().map(|thread| (0..side_parts).map(|part| thread.events.len(part)).sum::<usize>()).sum();
     let side_threads = (side_events / 200_000 + 1).min(threads);
     let next = AtomicUsize::new(0);
-    let more: Vec<Vec<Tally>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..side_threads)
-            .map(|thread| {
+    let more: Vec<Vec<Tally>> = {
+        {
+            {
                 let next = &next;
-                scope.spawn(move || {
+                pool::map(side_threads, move |thread| {
                     let mut worker = Worker::new(context, output, thread);
                     loop {
                         let part = next.fetch_add(1, Relaxed);
@@ -1279,10 +1956,9 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                     worker.write_file();
                     worker.tallies
                 })
-            })
-            .collect();
-        handles.into_iter().map(|handle| handle.join().unwrap()).collect()
-    });
+            }
+        }
+    };
     tallies.extend(more);
     lap("dense: side path");
 

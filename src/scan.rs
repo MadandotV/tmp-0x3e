@@ -1,24 +1,7 @@
 
 use std::arch::x86_64::*;
-use std::fs;
-use std::path::Path;
 
-pub struct Input {
-    file: fs::File,
-    len: usize,
-}
-
-impl Input {
-    pub fn len(&self) -> u64 {
-        self.len as u64
-    }
-}
-
-pub fn open(path: &Path) -> Input {
-    let file = fs::File::open(path).unwrap();
-    let len = file.metadata().unwrap().len() as usize;
-    Input { file, len }
-}
+pub use crate::source::{open, Source as Input};
 
 #[derive(Clone, Copy)]
 pub struct Task {
@@ -45,16 +28,25 @@ const OVERHANG: usize = 4096;
 
 pub struct Buffer {
     bytes: Vec<u8>,
+    base: *const u8,
+    held: (usize, usize),
 }
 
 impl Buffer {
     pub fn new() -> Self {
-        Buffer { bytes: Vec::new() }
+        Buffer { bytes: Vec::new(), base: std::ptr::null(), held: (0, 0) }
     }
 
     unsafe fn fill(&mut self, input: &Input, task: Task) -> (usize, usize) {
         use std::os::fd::AsRawFd;
-        let fd = input.file.as_raw_fd();
+        crate::source::release(self.held.0, self.held.1);
+        self.held = (0, 0);
+        if let Some((base, start, end)) = input.window(task.from, task.to) {
+            self.base = base;
+            self.held = (base as usize + start, base as usize + end);
+            return (start, end);
+        }
+        let fd = input.file.as_ref().unwrap().as_raw_fd();
         let origin = task.from.saturating_sub(1);
         let mut want = (task.to + OVERHANG).min(input.len) - origin;
         let mut have = 0;
@@ -62,6 +54,7 @@ impl Buffer {
             if self.bytes.len() < want + 65 {
                 self.bytes.resize(want + 65, 0);
             }
+            self.base = self.bytes.as_ptr();
             while have < want {
                 let got = libc::pread(
                     fd,
@@ -176,7 +169,7 @@ unsafe fn slow_line<const N: usize>(at: *const u8, out: &mut [Field; N]) -> (usi
 #[inline(always)]
 pub unsafe fn run<const N: usize>(input: &Input, task: Task, buffer: &mut Buffer, mut line: impl FnMut(&[Field; N])) {
     let (mut from, to) = buffer.fill(input, task);
-    let base = buffer.bytes.as_ptr();
+    let base = buffer.base;
     if task.from == 0 {
         while from < to && *base.add(from) != b'\n' {
             from += 1;

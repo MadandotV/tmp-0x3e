@@ -1,7 +1,9 @@
 
 mod dense;
 mod mem;
+mod pool;
 mod scan;
+mod source;
 
 use std::arch::x86_64::*;
 use std::collections::HashMap;
@@ -296,50 +298,93 @@ fn load_context(data: &Path) -> Option<Context> {
     if window_end <= window_start || window_end - window_start + WEEK >= 1 << 31 {
         return None;
     }
-    let rows = |name: &str| -> Vec<(Vec<u8>, Vec<u8>)> {
-        let bytes = fs::read(data.join(name)).unwrap();
-        let mut lines: Vec<&[u8]> = bytes.split(|&byte| byte == b'\n').collect();
-        if lines.last().is_some_and(|last| last.is_empty()) {
-            lines.pop();
+    fn pair(line: &[u8]) -> Option<(&[u8], &[u8])> {
+        if line.is_empty() {
+            return None;
         }
-        lines
-            .into_iter()
-            .skip(1)
-            .filter_map(|line| slow::fields(line, 2).map(|row| (row[0].to_vec(), row[1].to_vec())))
-            .collect()
-    };
+        let mut out: [&[u8]; 2] = [&[], &[]];
+        let mut count = 0;
+        for field in line.split(|&byte| byte == b',') {
+            let quotes = field.iter().filter(|&&byte| byte == b'"').count();
+            let field = if quotes == 0 {
+                field
+            } else if quotes == 2 && field.len() >= 2 && field[0] == b'"' && field[field.len() - 1] == b'"' {
+                &field[1..field.len() - 1]
+            } else {
+                return None;
+            };
+            if count < 2 {
+                out[count] = field;
+            }
+            count += 1;
+        }
+        (count == 2).then_some((out[0], out[1]))
+    }
+    fn rows(bytes: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
+        let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+        bytes.split(|&byte| byte == b'\n').skip(1).filter_map(pair)
+    }
 
-    let products = rows(concat!("pro", "duc", "ts.", "csv"));
-    let mut categories: Vec<Vec<u8>> = products.iter().map(|(_, name)| name.clone()).collect();
-    categories.push(concat!("unk", "now", "n").as_bytes().to_vec());
-    categories.sort();
-    categories.dedup();
+    let product_bytes = fs::read(data.join(concat!("pro", "duc", "ts.", "csv"))).unwrap();
+    const SLOTS: usize = 1024;
+    let mut table = [u16::MAX; SLOTS];
+    let mut names: Vec<&[u8]> = vec![concat!("unk", "now", "n").as_bytes()];
+    let mut products: Vec<(&[u8], u16)> = Vec::with_capacity(product_bytes.len() / 12);
+    for (id, name) in rows(&product_bytes) {
+        let mut slot = name.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)) as usize % SLOTS;
+        let found = loop {
+            let entry = table[slot];
+            if entry == u16::MAX {
+                if names[0] == name {
+                    break 0;
+                }
+                if names.len() > 127 {
+                    return None;
+                }
+                table[slot] = names.len() as u16;
+                names.push(name);
+                break names.len() as u16 - 1;
+            }
+            if names[entry as usize] == name {
+                break entry;
+            }
+            slot = (slot + 1) % SLOTS;
+        };
+        products.push((id, found));
+    }
+    let mut order: Vec<u16> = (0..names.len() as u16).collect();
+    order.sort_by_key(|&index| names[index as usize]);
+    let categories: Vec<Vec<u8>> = order.iter().map(|&index| names[index as usize].to_vec()).collect();
     if categories.len() > 127 {
         return None;
     }
-    let category = |name: &[u8]| categories.binary_search_by(|probe| probe.as_slice().cmp(name)).unwrap() as u8;
+    let mut rank = vec![0u8; names.len()];
+    for (place, &index) in order.iter().enumerate() {
+        rank[index as usize] = place as u8;
+    }
     let numbers: Vec<Option<usize>> = products.iter().map(|(id, _)| canonical(id, b"p")).collect();
     let size = numbers.iter().flatten().max().map_or(0, |&most| most + 1);
     let mut category_by_number = vec![NO_CATEGORY; size];
     let mut category_by_name = HashMap::new();
-    for ((id, name), number) in products.iter().zip(&numbers) {
+    for (&(id, name), number) in products.iter().zip(&numbers) {
         match number {
-            Some(number) => category_by_number[*number] = category(name),
+            Some(number) => category_by_number[*number] = rank[name as usize],
             None => {
-                category_by_name.insert(id.clone(), category(name));
+                category_by_name.insert(id.to_vec(), rank[name as usize]);
             }
         }
     }
-    let unknown = category(concat!("unk", "now", "n").as_bytes());
+    let unknown = rank[0];
 
+    let campaign_bytes = fs::read(data.join(concat!("cam", "pai", "gns", ".cs", "v"))).unwrap();
     let mut campaign_ids = Vec::new();
     let mut channels = Vec::new();
     let mut seen = HashMap::new();
-    for (id, channel) in rows(concat!("cam", "pai", "gns", ".cs", "v")) {
-        if !seen.contains_key(&id) {
-            seen.insert(id.clone(), campaign_ids.len() as u32);
-            campaign_ids.push(id);
-            channels.push(channel);
+    for (id, channel) in rows(&campaign_bytes) {
+        if !seen.contains_key(id) {
+            seen.insert(id, campaign_ids.len() as u32);
+            campaign_ids.push(id.to_vec());
+            channels.push(channel.to_vec());
         }
     }
     let numbers: Vec<Option<usize>> = campaign_ids.iter().map(|id| canonical(id, b"c_")).collect();
@@ -393,7 +438,7 @@ fn is_pointer(value: u64) -> bool {
 impl Links {
     fn new(pairs: usize) -> Links {
         let capacity = (pairs * 3).max(64).next_power_of_two();
-        Links { slots: mem::zeroed(capacity * 16, false) as *const [AtomicU64; 2], mask: capacity - 1 }
+        Links { slots: mem::shared(capacity * 16) as *const [AtomicU64; 2], mask: capacity - 1 }
     }
 
     #[inline(always)]
@@ -507,9 +552,9 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
     let range = capacity.div_ceil(RANGES);
     let (next_job, next_fill) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let barrier = Barrier::new(threads);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
+    {
+        {
+            pool::run(threads, |_| {
                 while let Some(&(list, from)) = jobs.get(next_job.fetch_add(1, Relaxed)) {
                     let list = &pairs[list];
                     let batch = &list[from..(from + BATCH).min(list.len())];
@@ -558,7 +603,7 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
                 }
             });
         }
-    });
+    }
     links
 }
 
@@ -1216,9 +1261,20 @@ fn main() {
         }
     };
 
+    unsafe {
+        let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+            let last = (limit.rlim_cur.min(1 << 14) as i32).saturating_sub(1);
+            if last > 2 && libc::fcntl(last, libc::F_GETFD) == -1 && libc::dup2(2, last) == last {
+                libc::close(last);
+            }
+        }
+    }
+    pool::start(threads);
     if dense::run(&data, &output, threads, verbose, started) {
         unsafe { libc::_exit(0) };
     }
+    pool::unpin();
 
     let context = {
         let (data, output) = (data.clone(), output.clone());
@@ -1236,8 +1292,8 @@ fn main() {
     let event_bytes: u64 = event_inputs.iter().map(Input::len).sum();
     lap("opened");
 
-    const CHUNK: usize = 1 << 18;
-    let link_tasks = scan::tasks(&link_inputs, CHUNK);
+    let chunk = source::chunk();
+    let link_tasks = scan::tasks(&link_inputs, chunk.min(1 << 18));
     let next = AtomicUsize::new(0);
     let pairs: Vec<Vec<(u64, u64)>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -1271,8 +1327,8 @@ fn main() {
     lap("context");
 
     let record_bytes = (event_bytes / 2 + click_inputs.iter().map(Input::len).sum::<u64>()) as usize;
-    let click_tasks = scan::tasks(&click_inputs, CHUNK);
-    let event_tasks = scan::tasks(&event_inputs, CHUNK);
+    let click_tasks = scan::tasks(&click_inputs, chunk);
+    let event_tasks = scan::tasks(&event_inputs, chunk);
     let (next_click, next_event) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let parsed: Vec<Parsed> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)

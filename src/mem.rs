@@ -50,6 +50,25 @@ pub fn zeroed(bytes: usize, populate: bool) -> *mut u8 {
     }
 }
 
+pub fn shared(bytes: usize) -> *mut u8 {
+    let at = zeroed(bytes, false);
+    let pieces = bytes.max(4096).div_ceil(HUGE);
+    let threads = super::pool::threads().min(pieces);
+    let start = at as usize;
+    super::pool::run(threads, |thread| unsafe {
+        let from = start + pieces * thread / threads * HUGE;
+        let to = (start + pieces * (thread + 1) / threads * HUGE).min(start + bytes.max(4096));
+        if to > from && libc::madvise(from as *mut libc::c_void, to - from, libc::MADV_POPULATE_WRITE) != 0 {
+            let mut page = from;
+            while page < to {
+                (page as *mut u8).write_volatile(0);
+                page += 4096;
+            }
+        }
+    });
+    at
+}
+
 pub struct Arena {
     at: *mut u8,
     mapped: *mut u8,
