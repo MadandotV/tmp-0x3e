@@ -1,5 +1,6 @@
 
 mod codec;
+mod lines;
 mod stamp;
 #[cfg(test)]
 mod tests;
@@ -42,6 +43,7 @@ const SIDE: u8 = 8;
 
 static BAIL: AtomicBool = AtomicBool::new(false);
 static VIOLATION: AtomicBool = AtomicBool::new(false);
+static PLAIN: AtomicU64 = AtomicU64::new(0);
 
 #[cold]
 fn bail() {
@@ -70,8 +72,12 @@ struct Shared<'a> {
     context: &'a Context,
     plan: Plan,
     ingest_start: i64,
-    state: Vec<AtomicU8>,
-    adjacent: Vec<AtomicU64>,
+    state: &'static [AtomicU8],
+    adjacent: &'static [AtomicU64],
+}
+
+fn zeros<T>(count: usize) -> &'static [T] {
+    unsafe { std::slice::from_raw_parts(super::mem::zeroed(count * std::mem::size_of::<T>(), false) as *const T, count) }
 }
 
 struct Raw<T>(*mut T);
@@ -122,9 +128,6 @@ fn finish_key(low: u64, numbers: &[u64], bound: u64) -> Option<(u64, u64)> {
                     fit += 1;
                     most = most.max(index);
                 }
-            }
-            if std::env::var_os("DENSE_DEBUG").is_some() {
-                eprintln!("key {key:x}: {fit} of {} fit, most {most}", numbers.len());
             }
             if numbers.len() >= 32 && fit * 100 >= numbers.len() * 99 {
                 return Some((key, most));
@@ -185,9 +188,6 @@ fn detect(link_paths: &[PathBuf], event_paths: &[PathBuf]) -> Result<Plan, &'sta
             votes.pair(a, b, from, to);
         }
         event = votes.settle().and_then(|low| finish_key(low, &event_numbers, MOST_BUCKETS << BUCKET_BITS));
-        if std::env::var_os("DENSE_DEBUG").is_some() {
-            eprintln!("event key: {} pairs, distances to {to}, {} hits, found {}", pairs.len(), votes.hits.len(), event.is_some());
-        }
         if event.is_some() {
             break;
         }
@@ -405,6 +405,59 @@ impl<'a> Parser<'a> {
         } else {
             let who = if dense != NONE { dense as u32 } else { self.foreign(user, user_len) };
             self.odd_click(id, id_len, who, stamp as u32, campaign);
+        }
+    }
+}
+
+impl lines::Events for Parser<'_> {
+    #[inline(always)]
+    fn calendar(&mut self) -> &mut Calendar {
+        &mut self.calendar
+    }
+
+    #[inline(always)]
+    unsafe fn plain(&mut self, fields: &[Field; 7]) {
+        PLAIN.fetch_add(1, Relaxed);
+        self.event_line(fields);
+    }
+
+    #[inline(always)]
+    unsafe fn fused(&mut self, line: &lines::Fused) {
+        let shared = self.shared;
+        let context = shared.context;
+        let seconds = line.ingest.wrapping_sub(shared.ingest_start) as u64;
+        if seconds >= (1 << INGEST_BITS) - 1 {
+            return bail();
+        }
+        let mut stamp = INVALID;
+        let mut payload = 0u32;
+        let mut who = 0u32;
+        'valid: {
+            if line.ts < context.window_start || line.ts >= context.window_end || line.ingest * 1000 - line.ts > DAY {
+                break 'valid;
+            }
+            if line.purchase {
+                match number(line.price.0, line.price.1) {
+                    Some(value) if (1..=10_000_000).contains(&value) => {
+                        payload = u32::from(context.category(line.product.0, line.product.1)) << 24 | value as u32;
+                    }
+                    _ => break 'valid,
+                }
+            }
+            stamp = (line.ts - context.window_start) as u64;
+            let dense = unscramble(line.who, shared.plan.user_key);
+            who = if dense < (shared.plan.users as u64) << ALIAS_BITS { dense as u32 } else { self.foreign(line.user.0, line.user.1) };
+        }
+        let index = unscramble(line.event, shared.plan.event_key);
+        if index < shared.plan.event_bound {
+            let low = index & (BUCKET as u64 - 1);
+            let record = Rec {
+                a: u64::from(who) | stamp << 32 | (low >> 14) << 63,
+                b: u64::from(payload) | (seconds + 1) << 29 | (low & 0x3FFF) << 50,
+            };
+            self.events.push((index >> BUCKET_BITS) as usize, record);
+        } else {
+            self.odd_event(line.id.0, line.id.1, seconds, stamp, payload, who);
         }
     }
 }
@@ -916,13 +969,10 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
     let open_all = |paths: &[PathBuf]| -> Vec<Input> { paths.iter().map(|path| scan::open(path)).collect() };
     let link_inputs = open_all(&link_paths);
     let click_inputs = open_all(&click_paths);
-    let event_inputs = open_all(&event_paths);
-    let event_bytes: u64 = event_inputs.iter().map(Input::len).sum();
+    let event_inputs: Vec<lines::Input> = event_paths.iter().map(|path| lines::open(path)).collect();
+    let event_bytes: u64 = event_inputs.iter().map(lines::Input::len).sum();
     let click_bytes: u64 = click_inputs.iter().map(Input::len).sum();
     lap("dense: keys");
-    if std::env::var_os("DENSE_STOP").is_some() {
-        std::process::exit(0);
-    }
 
     let Some(mut context) = context.join().unwrap() else { return refuse("no context") };
     if context.categories.len() > 32 || context.campaign_ids.len() >= 1 << 24 {
@@ -938,8 +988,8 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
         context,
         plan,
         ingest_start: context.window_start.div_euclid(1000) - INGEST_LEAD,
-        state: (0..users).map(|_| AtomicU8::new(0)).collect(),
-        adjacent: (0..users).map(|_| AtomicU64::new(0)).collect(),
+        state: zeros(users),
+        adjacent: zeros(users),
     };
     let shared = &shared;
 
@@ -1002,7 +1052,8 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
     let record_bytes = (event_bytes / 80 * 16 + click_bytes / 45 * 16) as usize;
     let click_parts = users >> USER_BITS;
     let click_tasks = scan::tasks(&click_inputs, CHUNK);
-    let event_tasks = scan::tasks(&event_inputs, CHUNK);
+    let event_tasks = lines::tasks(&event_inputs, CHUNK);
+    let plain = std::env::var_os("DENSE_PLAIN").is_some();
     let (next_click, next_event) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let parsed: Vec<Parse> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -1022,8 +1073,13 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                         odd_clicks: Vec::new(),
                     };
                     let mut buffer = Buffer::new();
+                    let mut event_buffer = lines::Buffer::new();
                     while let Some(&task) = event_tasks.get(next_event.fetch_add(1, Relaxed)) {
-                        scan::run::<7>(&event_inputs[task.file], task, &mut buffer, |fields| parser.event_line(fields));
+                        if plain {
+                            lines::run_plain(&event_inputs[task.file], task, &mut event_buffer, &mut parser);
+                        } else {
+                            lines::run_events(&event_inputs[task.file], task, &mut event_buffer, &mut parser);
+                        }
                     }
                     while let Some(&task) = click_tasks.get(next_click.fetch_add(1, Relaxed)) {
                         scan::run::<4>(&click_inputs[task.file], task, &mut buffer, |fields| parser.click_line(fields));
@@ -1043,6 +1099,9 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
     lap("dense: parsed");
+    if verbose {
+        eprintln!("dense: {} event lines were read the plain way", PLAIN.load(Relaxed));
+    }
     if BAIL.load(Relaxed) {
         return refuse("a row does not fit");
     }

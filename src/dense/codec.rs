@@ -59,15 +59,12 @@ pub unsafe fn decode(at: *const u8, len: usize, prefix: u8) -> u64 {
     }
     let word = raw << (8 * (8 - digits)) | *FILL.get_unchecked(digits);
     let bytes = _mm_cvtsi64_si128(word as i64);
-    let number = _mm_sub_epi8(bytes, _mm_set1_epi8(b'0' as i8));
-    let letter = _mm_sub_epi8(bytes, _mm_set1_epi8(b'a' as i8));
-    let is_number = _mm_cmpeq_epi8(_mm_min_epu8(number, _mm_set1_epi8(9)), number);
-    let is_letter = _mm_cmpeq_epi8(_mm_min_epu8(letter, _mm_set1_epi8(25)), letter);
-    let value = _mm_or_si128(
-        _mm_and_si128(number, is_number),
-        _mm_and_si128(_mm_add_epi8(letter, _mm_set1_epi8(10)), is_letter),
-    );
-    if _mm_movemask_epi8(_mm_or_si128(is_number, is_letter)) & 0xFF != 0xFF {
+    let above = _mm_cmpgt_epi8(bytes, _mm_set1_epi8(b'9' as i8));
+    let base = _mm_add_epi8(_mm_set1_epi8(b'0' as i8), _mm_and_si128(above, _mm_set1_epi8((b'a' - 10 - b'0') as i8)));
+    let value = _mm_sub_epi8(bytes, base);
+    let least = _mm_and_si128(above, _mm_set1_epi8(10));
+    let held = _mm_min_epu8(_mm_max_epu8(value, least), _mm_set1_epi8(35));
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(held, value)) & 0xFF != 0xFF {
         return NONE;
     }
     let pairs = _mm_maddubs_epi16(value, _mm_set1_epi16(0x0124));
@@ -79,6 +76,57 @@ pub unsafe fn decode(at: *const u8, len: usize, prefix: u8) -> u64 {
     } else {
         out
     }
+}
+
+static ALIGN: [[u8; 16]; 9] = {
+    let mut table = [[0x80u8; 16]; 9];
+    let mut digits = 0;
+    while digits <= 8 {
+        let mut at = 0;
+        while at < digits {
+            table[digits][8 - digits + at] = at as u8;
+            at += 1;
+        }
+        digits += 1;
+    }
+    table
+};
+static ZEROS: [[u8; 16]; 9] = {
+    let mut table = [[0u8; 16]; 9];
+    let mut digits = 0;
+    while digits <= 8 {
+        let mut at = 0;
+        while at < 8 - digits {
+            table[digits][at] = b'0';
+            at += 1;
+        }
+        digits += 1;
+    }
+    table
+};
+
+#[inline(always)]
+pub unsafe fn decode2<const A: u8, const B: u8>(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> (bool, u64, u64) {
+    let (first, second) = (a_len.wrapping_sub(1), b_len.wrapping_sub(1));
+    let aligned = |at: *const u8, digits: usize| {
+        let digits = digits.min(8);
+        let text = _mm_loadu_si128(at.add(1) as *const __m128i);
+        let moved = _mm_shuffle_epi8(text, _mm_loadu_si128(ALIGN.get_unchecked(digits).as_ptr() as *const __m128i));
+        _mm_or_si128(moved, _mm_loadu_si128(ZEROS.get_unchecked(digits).as_ptr() as *const __m128i))
+    };
+    let bytes = _mm_unpacklo_epi64(aligned(a, first), aligned(b, second));
+    let above = _mm_cmpgt_epi8(bytes, _mm_set1_epi8(b'9' as i8));
+    let base = _mm_add_epi8(_mm_set1_epi8(b'0' as i8), _mm_and_si128(above, _mm_set1_epi8((b'a' - 10 - b'0') as i8)));
+    let value = _mm_sub_epi8(bytes, base);
+    let least = _mm_and_si128(above, _mm_set1_epi8(10));
+    let held = _mm_min_epu8(_mm_max_epu8(value, least), _mm_set1_epi8(35));
+    let fits = _mm_movemask_epi8(_mm_cmpeq_epi8(held, value)) == 0xFFFF;
+    let pairs = _mm_maddubs_epi16(value, _mm_set1_epi16(0x0124));
+    let fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0510));
+    let number = |both: u64| (both & 0xFFFF_FFFF) * 1_679_616 + (both >> 32);
+    let (one, two) = (number(_mm_cvtsi128_si64(fours) as u64), number(_mm_extract_epi64(fours, 1) as u64));
+    let shape = |at: *const u8, digits: usize, prefix: u8| (digits.wrapping_sub(1) <= 7) & (*at == prefix) & ((*at.add(1) != b'0') | (digits == 1));
+    (shape(a, first, A) & shape(b, second, B) & fits & (one <= MASK) & (two <= MASK), one, two)
 }
 
 pub fn decode_bytes(id: &[u8], prefix: u8) -> u64 {
@@ -131,7 +179,7 @@ pub fn order(value: u64) -> u64 {
 
 #[derive(Default)]
 pub struct Votes {
-    pub hits: Vec<(u64, u64, u64, u64)>,
+    hits: Vec<(u64, u64, u64, u64)>,
 }
 
 const LOW: u64 = (1 << 39) - 1;
