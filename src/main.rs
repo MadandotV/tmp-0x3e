@@ -1,4 +1,5 @@
 
+mod dense;
 mod mem;
 mod scan;
 
@@ -6,14 +7,14 @@ use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::Barrier;
 use std::time::Instant;
 
 use mem::{Arena, Scatter};
 use scan::{Buffer, Field, Input};
 use nb7x::keys;
-use nb7x::pqw::{self, Column, Kind, Mode, Spec};
+use nb7x::pqw::{self, Column, Kind, Spec};
 use nb7x::slow;
 
 const DAY: i64 = 86_400_000;
@@ -31,7 +32,6 @@ const INDEX_BITS: u32 = 26;
 const PART_BITS: u32 = 12;
 
 static BAIL: AtomicBool = AtomicBool::new(false);
-const NARROW_REVENUE: bool = false;
 
 #[cold]
 fn bail() {
@@ -49,7 +49,7 @@ struct Dedup {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Ev {
-    person: u32,
+    person: u64,
     ts: u32,
     payload: u32,
 }
@@ -57,27 +57,21 @@ struct Ev {
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Ck {
+    person: u64,
     id: u64,
-    person: u32,
     ts: u32,
     campaign: u32,
 }
 
 type Dedups = Scatter<Dedup, 4>;
-type Events = Scatter<Ev, 16>;
+type Events = Scatter<Ev, 4>;
 type Clicks = Scatter<Ck, 8>;
 
 
-#[derive(Clone, Copy)]
-#[repr(C, align(32))]
-struct Date {
-    head: u64,
-    tail: u64,
-    midnight: i64,
-}
-
 struct Calendar {
-    dates: [Date; 64],
+    prefix: u64,
+    days: i64,
+    days_in_month: u64,
 }
 
 fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
@@ -88,67 +82,57 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719_468
 }
 
-const DAY_DIGITS: u64 = 0x000F_0300_0000_0000;
-
 impl Calendar {
     fn new() -> Self {
-        let mut dates = [Date { head: 0, tail: 0, midnight: 0 }; 64];
-        dates[0].tail = 1;
-        Calendar { dates }
+        Calendar { prefix: 0, days: 0, days_in_month: 0 }
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn load(&mut self, at: *const u8) -> i64 {
-        let bytes = std::slice::from_raw_parts(at, 11);
+    fn load(&mut self, prefix: u64) -> bool {
+        let bytes = prefix.to_le_bytes();
         let digit = |at: usize| bytes[at].is_ascii_digit().then(|| i64::from(bytes[at] - b'0'));
-        let (Some(y1), Some(y2), Some(y3), Some(y4), Some(m1), Some(m2), Some(d1), Some(d2)) =
-            (digit(0), digit(1), digit(2), digit(3), digit(5), digit(6), digit(8), digit(9))
+        let (Some(y1), Some(y2), Some(y3), Some(y4), Some(m1), Some(m2)) =
+            (digit(0), digit(1), digit(2), digit(3), digit(5), digit(6))
         else {
-            return BAD;
+            return false;
         };
-        let (year, month, day) = (y1 * 1000 + y2 * 100 + y3 * 10 + y4, m1 * 10 + m2, d1 * 10 + d2);
-        if bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' || !(1..=12).contains(&month) {
-            return BAD;
+        let (year, month) = (y1 * 1000 + y2 * 100 + y3 * 10 + y4, m1 * 10 + m2);
+        if bytes[4] != b'-' || bytes[7] != b'-' || !(1..=12).contains(&month) {
+            return false;
         }
         let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-        let days_in_month = match month {
+        self.prefix = prefix;
+        self.days = days_from_civil(year, month, 1) - 1;
+        self.days_in_month = match month {
             4 | 6 | 9 | 11 => 30,
-            2 => 28 + i64::from(leap),
+            2 => 28 + u64::from(leap),
             _ => 31,
         };
-        if day < 1 || day > days_in_month {
-            return BAD;
-        }
-        let head = (at as *const u64).read_unaligned();
-        let tail = (at.add(3) as *const u64).read_unaligned();
-        let midnight = days_from_civil(year, month, day) * 86_400;
-        self.dates[_pext_u64(tail, DAY_DIGITS) as usize] = Date { head, tail, midnight };
-        midnight
+        true
     }
 }
 
 #[inline(always)]
 unsafe fn civil(at: *const u8, calendar: &mut Calendar) -> i64 {
-    let head = (at as *const u64).read_unaligned();
-    let tail = (at.add(3) as *const u64).read_unaligned();
-    let date = calendar.dates.get_unchecked(_pext_u64(tail, DAY_DIGITS) as usize);
-    let mut midnight = date.midnight;
-    if head != date.head || tail != date.tail {
-        midnight = calendar.load(at);
-        if midnight == BAD {
-            return BAD;
-        }
+    let prefix = (at as *const u64).read_unaligned();
+    if prefix != calendar.prefix && !calendar.load(prefix) {
+        return BAD;
     }
-    let time = (at.add(11) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00:00:00");
-    let parts = (time.wrapping_mul(10).wrapping_add(time >> 8)) & 0x00FF_0000_FF00_00FF;
-    if (time.wrapping_add(0x7676_7F76_767F_7676) | time) & 0x8080_8080_8080_8080
-        | parts.wrapping_add(0x0044_0000_4400_0068) & 0x0080_0000_8000_0080
-        != 0
+    let b = (at.add(8) as *const u64).read_unaligned() ^ u64::from_le_bytes(*b"00T00:00");
+    let c = u64::from((at.add(16) as *const u32).read_unaligned() & 0x00FF_FFFF) ^ u64::from_le_bytes(*b":00\0\0\0\0\0");
+    let check = |value: u64, add: u64| ((value.wrapping_add(add)) | value) & 0x8080_8080_8080_8080;
+    let (pairs, second) = (b.wrapping_mul(2561) >> 8, c.wrapping_mul(2561) >> 16 & 0xFF);
+    let (day, hour, minute) = (pairs & 0xFF, pairs >> 24 & 0xFF, pairs >> 48 & 0xFF);
+    if check(b, 0x7676_7F76_767F_7676) | check(c, 0x0000_0000_0076_767F) != 0
+        || day.wrapping_sub(1) >= calendar.days_in_month
+        || hour > 23
+        || minute > 59
+        || second > 59
     {
         return BAD;
     }
-    midnight + (parts.wrapping_mul(3600 << 40 | 60 << 16) >> 40) as i64 + (parts >> 48) as i64
+    (calendar.days + day as i64) * 86_400 + (hour * 3600 + minute * 60 + second) as i64
 }
 
 static RIGHT_ALIGN: [[u8; 16]; 17] = {
@@ -253,7 +237,6 @@ struct Context {
     campaign_by_name: HashMap<Vec<u8>, u32>,
     event_bits: u32,
     person_bits: u32,
-    person_shift: u32,
 }
 
 fn canonical(id: &[u8], prefix: &[u8]) -> Option<usize> {
@@ -391,7 +374,6 @@ fn load_context(data: &Path) -> Option<Context> {
         campaign_by_name,
         event_bits: 0,
         person_bits: 0,
-        person_shift: 0,
     })
 }
 
@@ -399,55 +381,19 @@ fn load_context(data: &Path) -> Option<Context> {
 struct Links {
     slots: *const [AtomicU64; 2],
     mask: usize,
-    bits: u32,
-    budget: AtomicI64,
 }
 
 unsafe impl Sync for Links {}
 
-const GRANT: i64 = 64;
-
-static PATHS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
-
-#[cold]
-#[inline(never)]
-fn grow(bits: u32) -> ! {
-    use std::os::unix::process::CommandExt;
-    static ONCE: AtomicBool = AtomicBool::new(false);
-    if ONCE.swap(true, Relaxed) {
-        loop {
-            std::thread::park();
-        }
-    }
-    if bits < 30 {
-        let program = std::env::current_exe().unwrap_or_else(|_| PathBuf::from(std::env::args_os().next().unwrap()));
-        let _ = std::process::Command::new(program)
-            .args(std::env::args_os().skip(1))
-            .env("NB7X_TABLE_BITS", (bits + 1).to_string())
-            .exec();
-    }
-    let (data, output) = PATHS.get().unwrap();
-    slow::run(data, output);
-    unsafe { libc::_exit(0) }
+#[inline(always)]
+fn is_pointer(value: u64) -> bool {
+    value != 0 && value < keys::SMALLEST
 }
 
 impl Links {
-    fn new(bits: u32) -> Links {
-        let capacity = 1usize << bits;
-        Links {
-            slots: mem::zeroed(capacity * 16, false) as *const [AtomicU64; 2],
-            mask: capacity - 1,
-            bits,
-            budget: AtomicI64::new((capacity / 4 * 3) as i64),
-        }
-    }
-
-    fn touch(&self, share: usize, shares: usize) {
-        let slots = self.mask + 1;
-        let (from, to) = (slots * share / shares, slots * (share + 1) / shares);
-        for at in (from..to).step_by(4096 / 16) {
-            self.key(at).store(0, Relaxed);
-        }
+    fn new(pairs: usize) -> Links {
+        let capacity = (pairs * 3).max(64).next_power_of_two();
+        Links { slots: mem::zeroed(capacity * 16, false) as *const [AtomicU64; 2], mask: capacity - 1 }
     }
 
     #[inline(always)]
@@ -470,32 +416,31 @@ impl Links {
         unsafe { _mm_prefetch(self.slots.add(self.home(user)) as *const i8, _MM_HINT_T0) };
     }
 
-    #[cold]
-    #[inline(never)]
-    fn refill(&self, grant: &mut i64) {
-        if self.budget.fetch_sub(GRANT, Relaxed) < GRANT {
-            grow(self.bits);
-        }
-        *grant = GRANT;
-    }
-
     #[inline(always)]
-    fn person(&self, user: u64, grant: &mut i64) -> u32 {
-        let at = self.insert(user, grant);
-        let up = self.value(at).load(Relaxed);
-        (if up == 0 { at as u64 } else { up - 1 }) as u32
+    fn person(&self, user: u64) -> u64 {
+        let mut at = self.home(user);
+        loop {
+            let key = self.key(at).load(Relaxed);
+            if key == user {
+                return self.value(at).load(Relaxed);
+            }
+            if key == 0 {
+                return user;
+            }
+            at = (at + 1) & self.mask;
+        }
     }
 
     #[inline(always)]
     fn prefetch_parent(&self, at: usize) {
         let value = self.value(at).load(Relaxed);
-        if value != 0 {
+        if is_pointer(value) {
             unsafe { _mm_prefetch(self.slots.add(value as usize - 1) as *const i8, _MM_HINT_T0) };
         }
     }
 
     #[inline(always)]
-    fn insert(&self, user: u64, grant: &mut i64) -> usize {
+    fn insert(&self, user: u64) -> usize {
         let mut at = self.home(user);
         loop {
             let key = self.key(at).load(Relaxed);
@@ -503,14 +448,8 @@ impl Links {
                 return at;
             }
             if key == 0 {
-                if *grant == 0 {
-                    self.refill(grant);
-                }
                 match self.key(at).compare_exchange(0, user, Relaxed, Relaxed) {
-                    Ok(_) => {
-                        *grant -= 1;
-                        return at;
-                    }
+                    Ok(_) => return at,
                     Err(actual) if actual == user => return at,
                     Err(_) => {}
                 }
@@ -523,12 +462,12 @@ impl Links {
     fn root(&self, mut at: usize) -> usize {
         loop {
             let up = self.value(at).load(Relaxed);
-            if up == 0 {
+            if !is_pointer(up) {
                 return at;
             }
             let up_at = up as usize - 1;
             let above = self.value(up_at).load(Relaxed);
-            if above != 0 {
+            if is_pointer(above) {
                 self.value(at).store(above, Relaxed);
             }
             at = up_at;
@@ -551,10 +490,11 @@ impl Links {
     }
 }
 
-fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>], links: &Links) {
+fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>]) -> Links {
     let total: usize = pairs.iter().map(Vec::len).sum();
+    let links = Links::new(total);
     if total == 0 {
-        return;
+        return links;
     }
     let capacity = links.mask + 1;
     const BATCH: usize = 1 << 12;
@@ -570,7 +510,6 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>], links: &Links) {
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
-                let mut grant = 0;
                 while let Some(&(list, from)) = jobs.get(next_job.fetch_add(1, Relaxed)) {
                     let list = &pairs[list];
                     let batch = &list[from..(from + BATCH).min(list.len())];
@@ -581,7 +520,7 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>], links: &Links) {
                         }
                         let mut slots = [(0usize, 0usize); 16];
                         for (slot, &(a, b)) in slots.iter_mut().zip(group) {
-                            *slot = (links.insert(a, &mut grant), links.insert(b, &mut grant));
+                            *slot = (links.insert(a), links.insert(b));
                             links.prefetch_parent(slot.0);
                             links.prefetch_parent(slot.1);
                         }
@@ -590,7 +529,6 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>], links: &Links) {
                         }
                     }
                 }
-                links.budget.fetch_add(grant, Relaxed);
                 barrier.wait();
                 loop {
                     let from = next_fill.fetch_add(1, Relaxed) * range;
@@ -604,26 +542,24 @@ fn build_links(threads: usize, pairs: &[Vec<(u64, u64)>], links: &Links) {
                                 links.prefetch_parent(ahead);
                             }
                         }
-                        let first = links.value(at).load(Relaxed);
-                        if first == 0 {
+                        let key = links.key(at).load(Relaxed);
+                        if key == 0 {
                             continue;
                         }
-                        let mut value = first;
-                        loop {
-                            let above = links.value(value as usize - 1).load(Relaxed);
-                            if above == 0 {
-                                break;
-                            }
-                            value = above;
+                        let mut value = links.value(at).load(Relaxed);
+                        let mut name = key;
+                        while is_pointer(value) {
+                            let up = value as usize - 1;
+                            name = links.key(up).load(Relaxed);
+                            value = links.value(up).load(Relaxed);
                         }
-                        if value != first {
-                            links.value(at).store(value, Relaxed);
-                        }
+                        links.value(at).store(if value == 0 { name } else { value }, Relaxed);
                     }
                 }
             });
         }
     });
+    links
 }
 
 
@@ -654,22 +590,21 @@ struct Parser<'a> {
     context: &'a Context,
     links: &'a Links,
     thread: u64,
-    grant: i64,
     calendar: Calendar,
     dedups: Dedups,
     events: Events,
     clicks: Clicks,
     pending: [Pending; RING],
     pending_count: usize,
-    pending_clicks: [(u64, Ck); RING],
+    pending_clicks: [Ck; RING],
     pending_click_count: usize,
 }
 
 impl<'a> Parser<'a> {
     #[inline(always)]
     unsafe fn finish_event(&mut self, pending: Pending) {
-        let person = self.links.person(pending.user, &mut self.grant);
-        let part = (person >> self.context.person_shift) as usize;
+        let person = self.links.person(pending.user);
+        let part = (keys::hash(person) >> (64 - self.context.person_bits)) as usize;
         let index = self.events.push(part, Ev { person, ts: pending.ts, payload: pending.payload });
         if index >= 1 << INDEX_BITS {
             bail();
@@ -736,9 +671,9 @@ impl<'a> Parser<'a> {
     }
 
     #[inline(always)]
-    unsafe fn finish_click(&mut self, (user, click): (u64, Ck)) {
-        let person = self.links.person(user, &mut self.grant);
-        let part = (person >> self.context.person_shift) as usize;
+    unsafe fn finish_click(&mut self, click: Ck) {
+        let person = self.links.person(click.person);
+        let part = (keys::hash(person) >> (64 - self.context.person_bits)) as usize;
         self.clicks.push(part, Ck { person, ..click });
     }
 
@@ -760,7 +695,7 @@ impl<'a> Parser<'a> {
         let user = keys::pack(user, user_len);
         self.links.prefetch(user);
         *self.pending_clicks.get_unchecked_mut(self.pending_click_count) =
-            (user, Ck { id: keys::pack(id, id_len), person: 0, ts: (ts - context.click_start) as u32, campaign });
+            Ck { person: user, id: keys::pack(id, id_len), ts: (ts - context.click_start) as u32, campaign };
         self.pending_click_count += 1;
         if self.pending_click_count == RING {
             self.finish_clicks();
@@ -859,31 +794,29 @@ struct Tally {
     assisted: u32,
 }
 
-fn t_one(revenue: Kind) -> [Spec; 6] {
-    [
-        Spec { name: concat!("use", "r_i", "d"), kind: Kind::Str, optional: false },
-        Spec { name: "day", kind: Kind::Date, optional: false },
-        Spec { name: concat!("ses", "sio", "ns"), kind: Kind::I32, optional: false },
-        Spec { name: concat!("eve", "nts"), kind: Kind::I32, optional: false },
-        Spec { name: concat!("rev", "enu", "e_c", "ent", "s"), kind: revenue, optional: false },
-        Spec { name: concat!("top", "_ca", "teg", "ory"), kind: Kind::Str, optional: true },
-    ]
-}
+const T_ONE: [Spec; 6] = [
+    Spec { name: concat!("use", "r_i", "d"), kind: Kind::Str, optional: false },
+    Spec { name: "day", kind: Kind::Date, optional: false },
+    Spec { name: concat!("ses", "sio", "ns"), kind: Kind::I32, optional: false },
+    Spec { name: concat!("eve", "nts"), kind: Kind::I32, optional: false },
+    Spec { name: concat!("rev", "enu", "e_c", "ent", "s"), kind: Kind::I64, optional: false },
+    Spec { name: concat!("top", "_ca", "teg", "ory"), kind: Kind::Str, optional: true },
+];
 
 struct Worker<'a> {
     context: &'a Context,
-    links: &'a Links,
     output: &'a Path,
     thread: usize,
     files: usize,
     rows: usize,
     columns: Vec<Column>,
-    run_person: u64,
-    run_len: usize,
-    most_revenue: i64,
     tallies: Vec<Tally>,
+    keys: Vec<u64>,
+    ids: Vec<u32>,
+    people: Vec<u64>,
     counts: Vec<u32>,
     click_counts: Vec<u32>,
+    owner: Vec<u32>,
     events: Vec<u64>,
     clicks: Vec<Ck>,
     active: Vec<u32>,
@@ -916,38 +849,22 @@ struct Row {
 }
 
 impl<'a> Worker<'a> {
-    fn new(context: &'a Context, links: &'a Links, output: &'a Path, thread: usize) -> Self {
+    fn new(context: &'a Context, output: &'a Path, thread: usize) -> Self {
         let campaigns = context.campaign_ids.len();
-        let mut columns: Vec<Column> = (0..6).map(|_| Column::default()).collect();
-        columns[0].mode = Mode::Runs;
-        for (column, values) in [(1, context.days), (2, 256), (5, context.categories.len())] {
-            columns[column].mode = Mode::Bytes;
-            columns[column].dictionary_len = values;
-        }
-        for day in 0..context.days {
-            columns[1].dictionary.extend_from_slice(&(context.first_day + day as i32).to_le_bytes());
-        }
-        for sessions in 0..256i32 {
-            columns[2].dictionary.extend_from_slice(&sessions.to_le_bytes());
-        }
-        for category in &context.categories {
-            columns[5].dictionary.extend_from_slice(&(category.len() as u32).to_le_bytes());
-            columns[5].dictionary.extend_from_slice(category);
-        }
         Worker {
             context,
-            links,
             output,
             thread,
             files: 0,
             rows: 0,
-            columns,
-            run_person: 0,
-            run_len: 0,
-            most_revenue: 0,
+            columns: (0..6).map(|_| Column::default()).collect(),
             tallies: vec![Tally::default(); (campaigns + 1) * context.days],
+            keys: Vec::new(),
+            ids: Vec::new(),
+            people: Vec::new(),
             counts: Vec::new(),
             click_counts: Vec::new(),
+            owner: Vec::new(),
             events: Vec::new(),
             clicks: Vec::new(),
             active: Vec::new(),
@@ -966,54 +883,23 @@ impl<'a> Worker<'a> {
         if self.rows == 0 && self.files > 0 {
             return;
         }
-        self.end_run();
-        let mut revenue = Kind::I64;
-        if NARROW_REVENUE && self.most_revenue <= i64::from(i32::MAX) {
-            revenue = Kind::I32;
-            let values = &mut self.columns[4].values;
-            for row in 0..self.rows {
-                values.copy_within(row * 8..row * 8 + 4, row * 4);
-            }
-            values.truncate(self.rows * 4);
-        }
         let path = self.output.join(concat!("use", "r_d", "ail", "y")).join(format!("part-{}-{}.parquet", self.thread, self.files));
-        pqw::write(&path, &t_one(revenue), &self.columns, self.rows).unwrap();
+        pqw::write(&path, &T_ONE, &self.columns, self.rows).unwrap();
         self.files += 1;
         self.rows = 0;
-        self.most_revenue = 0;
         for column in &mut self.columns {
             column.values.clear();
             column.present.clear();
-        }
-        self.columns[0].dictionary.clear();
-        self.columns[0].dictionary_len = 0;
-    }
-
-    #[inline(always)]
-    fn end_run(&mut self) {
-        if self.run_len > 0 {
-            let column = &mut self.columns[0];
-            column.push_run(self.run_len, column.dictionary_len - 1);
-            self.run_len = 0;
         }
     }
 
     #[inline(always)]
     fn emit(&mut self, person: u64, row: &Row) {
-        if person != self.run_person || self.run_len == 0 {
-            self.end_run();
-            self.run_person = person;
-            let column = &mut self.columns[0];
-            keys::unpack_string(person, &mut column.dictionary);
-            column.dictionary_len += 1;
-        }
-        self.run_len += 1;
-        assert!(row.sessions < 256);
-        self.columns[1].values.push(row.day as u8);
-        self.columns[2].values.push(row.sessions as u8);
+        keys::unpack_string(person, &mut self.columns[0].values);
+        self.columns[1].push_i32(self.context.first_day + row.day as i32);
+        self.columns[2].push_i32(row.sessions as i32);
         self.columns[3].push_i32(row.events as i32);
         self.columns[4].push_i64(row.revenue);
-        self.most_revenue = self.most_revenue.max(row.revenue);
         let mut top = u32::MAX;
         let mut best = 0;
         for &category in &self.category_used {
@@ -1026,7 +912,7 @@ impl<'a> Worker<'a> {
         self.category_used.clear();
         self.columns[5].push_present(self.rows, top != u32::MAX);
         if top != u32::MAX {
-            self.columns[5].values.push(top as u8);
+            self.columns[5].push_str(&self.context.categories[top as usize]);
         }
         self.rows += 1;
         if self.rows >= 1 << 20 {
@@ -1039,81 +925,124 @@ impl<'a> Worker<'a> {
         if total == 0 {
             return;
         }
-        let shift = self.context.person_shift;
-        let bins = 1usize << shift;
-        let mask = bins as u32 - 1;
+        let capacity = (total * 2).next_power_of_two();
+        let mask = capacity - 1;
+        let shift = 64 - self.context.person_bits - capacity.trailing_zeros().min(64 - self.context.person_bits);
+        self.keys.clear();
+        self.keys.resize(capacity, 0);
+        self.ids.resize(capacity, 0);
+        self.people.clear();
         self.counts.clear();
-        self.counts.resize(bins + 1, 0);
-        let counts = self.counts.as_mut_ptr();
+        self.owner.clear();
         for thread in parsed {
             thread.events.for_each_chunk(part, |chunk| {
                 for event in chunk {
-                    let bin = if event.payload == TOMBSTONE { bins } else { (event.person & mask) as usize };
-                    *counts.add(bin) += 1;
+                    if event.payload == TOMBSTONE {
+                        continue;
+                    }
+                    let mut at = (keys::hash(event.person) >> shift) as usize & mask;
+                    let id = loop {
+                        let key = self.keys.get_unchecked_mut(at);
+                        if *key == event.person {
+                            break *self.ids.get_unchecked(at);
+                        }
+                        if *key == 0 {
+                            *key = event.person;
+                            let id = self.people.len() as u32;
+                            *self.ids.get_unchecked_mut(at) = id;
+                            self.people.push(event.person);
+                            self.counts.push(0);
+                            break id;
+                        }
+                        at = (at + 1) & mask;
+                    };
+                    *self.counts.get_unchecked_mut(id as usize) += 1;
+                    self.owner.push(id);
                 }
             });
         }
-        let click_total: usize = parsed.iter().map(|thread| thread.clicks.len(part)).sum();
+        let people = self.people.len();
+        let mut sum = 0;
+        for count in &mut self.counts {
+            sum += *count;
+            *count = sum;
+        }
+        let total = sum as usize;
+        self.events.clear();
+        self.events.resize(total, 0);
+        let mut next = 0;
+        for thread in parsed {
+            thread.events.for_each_chunk(part, |chunk| {
+                for event in chunk {
+                    if event.payload == TOMBSTONE {
+                        continue;
+                    }
+                    let id = *self.owner.get_unchecked(next) as usize;
+                    next += 1;
+                    let at = self.counts.get_unchecked_mut(id);
+                    *at -= 1;
+                    *self.events.get_unchecked_mut(*at as usize) = u64::from(event.ts) << 32 | u64::from(event.payload);
+                }
+            });
+        }
+        self.counts.push(total as u32);
+
         self.click_counts.clear();
-        self.click_counts.resize(bins + 1, 0);
-        let click_counts = self.click_counts.as_mut_ptr();
+        self.click_counts.resize(people, 0);
+        self.owner.clear();
         for thread in parsed {
             thread.clicks.for_each_chunk(part, |chunk| {
                 for click in chunk {
-                    let local = (click.person & mask) as usize;
-                    let bin = if *counts.add(local) == 0 { bins } else { local };
-                    *click_counts.add(bin) += 1;
+                    let mut at = (keys::hash(click.person) >> shift) as usize & mask;
+                    let id = loop {
+                        let key = *self.keys.get_unchecked(at);
+                        if key == click.person {
+                            break *self.ids.get_unchecked(at);
+                        }
+                        if key == 0 {
+                            break u32::MAX;
+                        }
+                        at = (at + 1) & mask;
+                    };
+                    if id != u32::MAX {
+                        self.click_counts[id as usize] += 1;
+                    }
+                    self.owner.push(id);
                 }
             });
         }
         let mut sum = 0;
         for count in &mut self.click_counts {
-            sum += std::mem::replace(count, sum);
+            sum += *count;
+            *count = sum;
         }
+        let click_total = sum as usize;
         self.clicks.clear();
-        self.clicks.reserve(click_total);
-        let clicks = self.clicks.as_mut_ptr();
+        self.clicks.resize(click_total, Ck { person: 0, id: 0, ts: 0, campaign: 0 });
+        let mut next = 0;
         for thread in parsed {
             thread.clicks.for_each_chunk(part, |chunk| {
                 for click in chunk {
-                    let local = (click.person & mask) as usize;
-                    let bin = if *counts.add(local) == 0 { bins } else { local };
-                    let at = click_counts.add(bin);
-                    clicks.add(*at as usize).write(*click);
-                    *at += 1;
+                    let id = self.owner[next];
+                    next += 1;
+                    if id != u32::MAX {
+                        self.click_counts[id as usize] -= 1;
+                        self.clicks[self.click_counts[id as usize] as usize] = *click;
+                    }
                 }
             });
         }
-        let mut sum = 0;
-        for count in &mut self.counts {
-            sum += std::mem::replace(count, sum);
-        }
-        self.events.clear();
-        self.events.reserve(total);
-        let events = self.events.as_mut_ptr();
-        for thread in parsed {
-            thread.events.for_each_chunk(part, |chunk| {
-                for event in chunk {
-                    let bin = if event.payload == TOMBSTONE { bins } else { (event.person & mask) as usize };
-                    let at = counts.add(bin);
-                    events.add(*at as usize).write(u64::from(event.ts) << 32 | u64::from(event.payload));
-                    *at += 1;
-                }
-            });
-        }
+        self.click_counts.push(click_total as u32);
 
-        let (mut event_from, mut click_from) = (0, 0);
-        for local in 0..bins {
-            let (event_to, click_to) = (*counts.add(local) as usize, *click_counts.add(local) as usize);
-            if event_to != event_from {
-                let name = self.links.key(part << shift | local).load(Relaxed);
-                self.person(name, event_from..event_to, click_from..click_to);
-            }
-            (event_from, click_from) = (event_to, click_to);
+        for person in 0..people {
+            let events = self.counts[person] as usize..self.counts[person + 1] as usize;
+            let clicks = self.click_counts[person] as usize..self.click_counts[person + 1] as usize;
+            self.person(person, events, clicks);
         }
     }
 
-    fn person(&mut self, name: u64, events: std::ops::Range<usize>, clicks: std::ops::Range<usize>) {
+    fn person(&mut self, person: usize, events: std::ops::Range<usize>, clicks: std::ops::Range<usize>) {
+        let name = self.people[person];
         let days = self.context.days;
         let organic = self.context.campaign_ids.len();
         let events = unsafe { std::slice::from_raw_parts_mut(self.events.as_mut_ptr().add(events.start), events.len()) };
@@ -1287,10 +1216,10 @@ fn main() {
         }
     };
 
-    let open_all = |folder: &str| -> Vec<Input> { csv_files(&data.join(folder)).iter().map(|path| scan::open(path)).collect() };
-    let link_inputs = open_all(concat!("lin", "ks"));
-    let click_inputs = open_all(concat!("cli", "cks"));
-    let event_inputs = open_all(concat!("eve", "nts"));
+    if dense::run(&data, &output, threads, verbose, started) {
+        unsafe { libc::_exit(0) };
+    }
+
     let context = {
         let (data, output) = (data.clone(), output.clone());
         std::thread::spawn(move || {
@@ -1300,16 +1229,11 @@ fn main() {
         })
     };
 
-    let bytes = |inputs: &[Input]| inputs.iter().map(Input::len).sum::<u64>();
-    let (link_bytes, click_bytes, event_bytes) = (bytes(&link_inputs), bytes(&click_inputs), bytes(&event_inputs));
-    let ids = link_bytes / 14 + event_bytes / 3000 + click_bytes / 3000;
-    let table_bits = std::env::var("NB7X_TABLE_BITS")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .map_or_else(|| (ids * 7 / 5).next_power_of_two().trailing_zeros().max(16), |bits| bits.clamp(8, 30));
-    PATHS.set((data.clone(), output.clone())).unwrap();
-    let links = Links::new(table_bits);
-    let links = &links;
+    let open_all = |folder: &str| -> Vec<Input> { csv_files(&data.join(folder)).iter().map(|path| scan::open(path)).collect() };
+    let link_inputs = open_all(concat!("lin", "ks"));
+    let click_inputs = open_all(concat!("cli", "cks"));
+    let event_inputs = open_all(concat!("eve", "nts"));
+    let event_bytes: u64 = event_inputs.iter().map(Input::len).sum();
     lap("opened");
 
     const CHUNK: usize = 1 << 18;
@@ -1317,10 +1241,8 @@ fn main() {
     let next = AtomicUsize::new(0);
     let pairs: Vec<Vec<(u64, u64)>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
-            .map(|thread| {
-                let (link_tasks, link_inputs, next) = (&link_tasks, &link_inputs, &next);
-                scope.spawn(move || {
-                    links.touch(thread, threads);
+            .map(|_| {
+                scope.spawn(|| {
                     let mut out = Vec::new();
                     let mut buffer = Buffer::new();
                     while let Some(&task) = link_tasks.get(next.fetch_add(1, Relaxed)) {
@@ -1335,7 +1257,8 @@ fn main() {
         handles.into_iter().map(|handle| handle.join().unwrap()).collect()
     });
     lap("links parsed");
-    build_links(threads, &pairs, links);
+    let links = build_links(threads, &pairs);
+    let links = &links;
     lap("links joined");
     let Some(mut context) = context.join().unwrap() else {
         return slow::run(&data, &output);
@@ -1343,12 +1266,11 @@ fn main() {
     let estimate = event_bytes / 80;
     let bits = |per: u64, most: u32| (estimate / per).max(1).next_power_of_two().trailing_zeros().clamp(4, most);
     context.event_bits = bits(40_000, 11);
-    context.person_bits = bits(90_000, 9).min(table_bits);
-    context.person_shift = table_bits - context.person_bits;
+    context.person_bits = bits(20_000, 11);
     let context = &context;
     lap("context");
 
-    let record_bytes = (event_bytes / 2 + click_bytes) as usize;
+    let record_bytes = (event_bytes / 2 + click_inputs.iter().map(Input::len).sum::<u64>()) as usize;
     let click_tasks = scan::tasks(&click_inputs, CHUNK);
     let event_tasks = scan::tasks(&event_inputs, CHUNK);
     let (next_click, next_event) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -1365,14 +1287,13 @@ fn main() {
                         context,
                         links,
                         thread: thread as u64,
-                        grant: 0,
                         calendar: Calendar::new(),
                         dedups: Scatter::new(arena, 1 << context.event_bits),
                         events: Scatter::new(arena, 1 << context.person_bits),
                         clicks: Scatter::new(arena, 1 << context.person_bits),
                         pending: [empty; RING],
                         pending_count: 0,
-                        pending_clicks: [(0, Ck { id: 0, person: 0, ts: 0, campaign: 0 }); RING],
+                        pending_clicks: [Ck { person: 0, id: 0, ts: 0, campaign: 0 }; RING],
                         pending_click_count: 0,
                     };
                     let mut buffer = Buffer::new();
@@ -1420,7 +1341,7 @@ fn main() {
             .map(|thread| {
                 let (parsed, next, output, barrier) = (&parsed, &next, &output, &barrier);
                 scope.spawn(move || {
-                    let mut worker = Worker::new(context, links, output, thread);
+                    let mut worker = Worker::new(context, output, thread);
                     loop {
                         let part = next.fetch_add(1, Relaxed);
                         if part >= person_parts {
