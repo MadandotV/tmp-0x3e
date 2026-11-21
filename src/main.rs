@@ -31,6 +31,7 @@ const INDEX_BITS: u32 = 26;
 const PART_BITS: u32 = 12;
 
 static BAIL: AtomicBool = AtomicBool::new(false);
+const NARROW_REVENUE: bool = false;
 
 #[cold]
 fn bail() {
@@ -967,7 +968,7 @@ impl<'a> Worker<'a> {
         }
         self.end_run();
         let mut revenue = Kind::I64;
-        if self.most_revenue <= i64::from(i32::MAX) {
+        if NARROW_REVENUE && self.most_revenue <= i64::from(i32::MAX) {
             revenue = Kind::I32;
             let values = &mut self.columns[4].values;
             for row in 0..self.rows {
