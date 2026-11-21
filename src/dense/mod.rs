@@ -26,12 +26,12 @@ use super::{
 use stamp::timestamp;
 use codec::{decode, decode_bytes, encode, premix, scramble, unscramble, Votes, MASK, NONE};
 
-const BUCKET_BITS: u32 = 15;
+const BUCKET_BITS: u32 = 14;
 const BUCKET: usize = 1 << BUCKET_BITS;
 const USER_BITS: u32 = 12;
 const ALIAS_BITS: u32 = 9;
 const MOST_USERS: usize = 1 << 22;
-const MOST_BUCKETS: u64 = 1 << 14;
+const MOST_BUCKETS: u64 = 1 << (29 - BUCKET_BITS);
 const INVALID: u64 = 0x7FFF_FFFF;
 const FOREIGN: u32 = 1 << 31;
 const FOREIGN_BITS: u32 = 27;
@@ -60,6 +60,7 @@ struct Rec {
     b: u64,
 }
 
+#[allow(dead_code)]
 const EMPTY: Rec = Rec { a: 0, b: 0 };
 
 type Recs = Scatter<Rec, 4>;
@@ -87,10 +88,6 @@ fn zeros<T>(count: usize) -> &'static [T] {
 struct Raw<T>(*mut T);
 unsafe impl<T> Sync for Raw<T> {}
 unsafe impl<T> Send for Raw<T> {}
-
-struct Sendable<T>(T);
-unsafe impl<T> Sync for Sendable<T> {}
-unsafe impl<T> Send for Sendable<T> {}
 
 fn sample(paths: &[PathBuf], bytes: usize, prefixes: [u8; 2]) -> Vec<(u64, u64)> {
     let Some(path) = paths.iter().max_by_key(|path| fs::metadata(path).map_or(0, |meta| meta.len())) else {
@@ -574,6 +571,14 @@ struct Job {
     pieces: Vec<(usize, usize, usize)>,
 }
 
+#[derive(Default)]
+struct OddRows {
+    events: Vec<(u32, u64)>,
+    clicks: Vec<(u32, Ck)>,
+}
+
+type OddUsers = HashMap<u32, OddRows>;
+
 fn stitch(edges: &[Edges]) -> Vec<Job> {
     let mut runs: Vec<(u32, u32, usize, usize, usize)> = Vec::new();
     for (thread, edge) in edges.iter().enumerate() {
@@ -599,22 +604,25 @@ struct Local<'a> {
     output: &'a Path,
     thread: usize,
     files: usize,
-    rows: usize,
-    columns: Vec<Column>,
+    sheets: [Sheet; 2],
     tallies: Vec<Tally>,
     assisted: Vec<u32>,
-    categories: Vec<u8>,
     credited: Vec<u32>,
     bought: Vec<[i64; 2]>,
     table: Table,
     best: Vec<Rec>,
     mark: u64,
+    others: Vec<u32>,
     who: Vec<u32>,
     events: Vec<u64>,
     sorted: Vec<u64>,
     assists: Vec<u32>,
+    keys: Vec<u64>,
+    copy: Vec<Rec>,
     before: Vec<DayCounts>,
     edges: Edges,
+    merged: Vec<Rec>,
+    long: (*mut u64, usize),
     active: Vec<u32>,
     active_count: Vec<u32>,
     active_at: Vec<u32>,
@@ -629,6 +637,17 @@ unsafe impl Send for Local<'_> {}
 
 const FILE_ROWS: usize = 1 << 16;
 const NO_CATEGORY: u8 = 255;
+static PAIRS: [u16; 1296] = {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut table = [0u16; 1296];
+    let mut value = 0;
+    while value < 1296 {
+        table[value] = DIGITS[value / 36] as u16 | (DIGITS[value % 36] as u16) << 8;
+        value += 1;
+    }
+    table
+};
+const EIGHT_DIGITS: u64 = 36 * 36 * 36 * 36 * 36 * 36 * 36;
 
 #[derive(Clone, Copy)]
 #[repr(align(32))]
@@ -670,16 +689,21 @@ fn steps_done() {
 const TOP: u32 = 1 << 31;
 const LOW: u32 = TOP - 1;
 const LOW_50: u64 = (1 << 50) - 1;
-const MARKS: u64 = (1 << 14) - 2;
-const UNUSED: Rec = Rec { a: 0, b: u64::MAX };
+const MARKS: u64 = (1 << 13) - 2;
+const UNUSED: Rec = Rec { a: 0, b: i64::MAX as u64 };
 
 #[inline(never)]
 unsafe fn keep_earliest(chunk: &[Rec], best: *mut Rec, mark: u64) {
+    use std::arch::x86_64::*;
+    let low = _mm_set_epi64x(LOW_50 as i64, -1);
+    let mark = _mm_set_epi64x(mark as i64, 0);
     for record in chunk {
-        let low = (record.b >> 50 | record.a >> 63 << 14) as usize;
-        let kept = best.add(low);
-        let new = Rec { a: record.a, b: record.b & LOW_50 | mark };
-        *kept = if new.b < (*kept).b { new } else { *kept };
+        let slot = (record.b >> 50 | record.a >> 49 & 0x4000) as usize;
+        let kept = best.add(slot) as *mut __m128i;
+        let new = _mm_or_si128(_mm_and_si128(_mm_loadu_si128(record as *const Rec as *const __m128i), low), mark);
+        let old = _mm_loadu_si128(kept);
+        let later = _mm_shuffle_epi32(_mm_cmpgt_epi64(old, new), 0xEE);
+        _mm_storeu_si128(kept, _mm_blendv_epi8(old, new, later));
     }
 }
 
@@ -705,16 +729,14 @@ static FRONT: [[u8; 16]; 16] = {
 };
 
 #[inline(never)]
-unsafe fn pack(best: *const Rec, marked: u64, who: *mut u32, ts: *mut u32, slots: *mut u32, buys: *mut u8) -> (usize, bool) {
+unsafe fn pack(best: *const Rec, marked: u64, who: *mut u32, ts: *mut u32, buys: *mut u64, others: &mut Vec<u32>) -> usize {
     use std::arch::x86_64::*;
-    std::ptr::write_bytes(buys, 0, BUCKET / 8 + 8);
+    let mut listed = 0;
     let halves = _mm256_setr_epi32(0, 4, 2, 6, 1, 5, 3, 7);
     let mark = _mm_set1_epi32(marked as i32);
     let invalid = _mm_set1_epi32(INVALID as i32);
     let payload = _mm_set1_epi32(0x1FFF_FFFF);
-    let mut slot = _mm_setr_epi32(0, 1, 2, 3);
-    let four = _mm_set1_epi32(4);
-    let (mut count, mut foreign) = (0usize, 0);
+    let mut count = 0usize;
     for group in 0..BUCKET / 4 {
         let (even, odd) = (_mm256_loadu_si256(best.add(4 * group) as *const __m256i), _mm256_loadu_si256(best.add(4 * group + 2) as *const __m256i));
         let firsts = _mm256_permutevar8x32_epi32(_mm256_unpacklo_epi64(even, odd), halves);
@@ -725,22 +747,24 @@ unsafe fn pack(best: *const Rec, marked: u64, who: *mut u32, ts: *mut u32, slots
         let valid = _mm_movemask_ps(_mm_castsi128_ps(_mm_andnot_si128(_mm_cmpeq_epi32(stamps, invalid), _mm_cmpeq_epi32(marks, mark)))) as usize;
         let other = _mm_movemask_ps(_mm_castsi128_ps(users)) as usize;
         let keep = valid & !other;
-        foreign |= valid & other;
+        if valid & other != 0 {
+            others.push(group as u32);
+        }
         let front = _mm_loadu_si128(FRONT.as_ptr().add(keep) as *const __m128i);
         _mm_storeu_si128(who.add(count) as *mut __m128i, _mm_shuffle_epi8(users, front));
         _mm_storeu_si128(ts.add(count) as *mut __m128i, _mm_shuffle_epi8(stamps, front));
-        _mm_storeu_si128(slots.add(count) as *mut __m128i, _mm_shuffle_epi8(slot, front));
-        slot = _mm_add_epi32(slot, four);
         let free = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(_mm256_castsi256_si128(seconds), payload), _mm_setzero_si128()))) as usize;
         let mut bought = keep & !free;
         while bought != 0 {
             let at = count + (keep & ((bought & bought.wrapping_neg()) - 1)).count_ones() as usize;
-            *buys.add(at >> 3) |= 1 << (at & 7);
+            *buys.add(listed) = ((4 * group) as u64 + u64::from(bought.trailing_zeros())) << 32 | at as u64;
+            listed += 1;
             bought &= bought - 1;
         }
         count += keep.count_ones() as usize;
     }
-    (count, foreign != 0)
+    *buys.add(listed) = u64::from(u32::MAX);
+    count
 }
 
 #[inline(always)]
@@ -751,7 +775,7 @@ unsafe fn front8(lanes: std::arch::x86_64::__m256i, mask: u32) -> std::arch::x86
 }
 
 #[inline(never)]
-unsafe fn sessions_of(who: *mut u32, ts: *mut u32, count: usize, buys: *const u8, first: *mut u32, start: *mut u32, bought: *mut u64) -> (usize, usize, bool) {
+unsafe fn sessions_of(who: *mut u32, ts: *mut u32, count: usize, buys: *const u64, first: *mut u32, start: *mut u32, bought: *mut u64) -> (usize, usize, bool) {
     use std::arch::x86_64::*;
     *who.sub(1) = u32::MAX;
     *ts.sub(1) = 0;
@@ -775,18 +799,81 @@ unsafe fn sessions_of(who: *mut u32, ts: *mut u32, count: usize, buys: *const u8
         _mm256_storeu_si256(first.add(sessions) as *mut __m256i, front8(_mm256_or_si256(number, _mm256_andnot_si256(same, top)), starts));
         _mm256_storeu_si256(start.add(sessions) as *mut __m256i, front8(stamps, starts));
         number = _mm256_add_epi32(number, eight);
-        let mut buying = u32::from(*buys.add(at >> 3));
-        while buying != 0 {
-            let lane = buying.trailing_zeros();
+        while ((*buys.add(purchases) as u32) as usize) < at + 8 {
+            let buy = *buys.add(purchases);
+            let lane = buy as u32 - at as u32;
             let session = sessions + (starts & ((2 << lane) - 1)).count_ones() as usize - 1;
-            *bought.add(purchases) = (session as u64) << 32 | (at as u64 + u64::from(lane));
+            *bought.add(purchases) = (session as u64) << 32 | buy >> 32;
             purchases += 1;
-            buying &= buying - 1;
         }
         sessions += starts.count_ones() as usize;
         at += 8;
     }
     (sessions, purchases, back != 0)
+}
+
+static BEFORE: [[u8; 8]; 256] = {
+    let mut table = [[0u8; 8]; 256];
+    let mut mask = 0;
+    while mask < 256 {
+        let mut lane = 1;
+        while lane < 8 {
+            table[mask][lane] = table[mask][lane - 1] + (mask >> (lane - 1) & 1) as u8;
+            lane += 1;
+        }
+        mask += 1;
+    }
+    table
+};
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn rows_of(
+    first: *const u32,
+    start: *const u32,
+    sessions: usize,
+    offset: u32,
+    organic: u32,
+    [day_of, campaign_of, row_of]: [*mut u32; 3],
+    [run_session, run_row]: [*mut u32; 2],
+    [row_session, row_event]: [*mut u32; 2],
+) -> (usize, usize) {
+    use std::arch::x86_64::*;
+    const _: () = assert!(DAY == 84375 << 10);
+    let (offset, by) = (_mm256_set1_epi32(offset as i32), _mm256_set1_epi64x(6_515_625));
+    let (organic, low, one, eight) = (_mm256_set1_epi32(organic as i32), _mm256_set1_epi32(LOW as i32), _mm256_set1_epi32(1), _mm256_set1_epi32(8));
+    let shifted = _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6);
+    let mut number = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    let mut last = _mm256_set1_epi32(-1);
+    let (mut rows, mut runs) = (0usize, 0usize);
+    let mut at = 0;
+    while at < sessions {
+        let left = sessions - at;
+        let real = if left >= 8 { 255 } else { (1u32 << left) - 1 };
+        let head = _mm256_loadu_si256(first.add(at) as *const __m256i);
+        let ten = _mm256_srli_epi32(_mm256_add_epi32(_mm256_loadu_si256(start.add(at) as *const __m256i), offset), 10);
+        let even = _mm256_srli_epi64(_mm256_mul_epu32(ten, by), 39);
+        let odd = _mm256_srli_epi64(_mm256_mul_epu32(_mm256_srli_epi64(ten, 32), by), 39);
+        let day = _mm256_or_si256(even, _mm256_slli_epi64(odd, 32));
+        _mm256_storeu_si256(day_of.add(at) as *mut __m256i, day);
+        _mm256_storeu_si256(campaign_of.add(at) as *mut __m256i, organic);
+        let before = _mm256_blend_epi32(_mm256_permutevar8x32_epi32(day, shifted), _mm256_permutevar8x32_epi32(last, _mm256_set1_epi32(7)), 1);
+        last = day;
+        let opens = _mm256_or_si256(_mm256_srai_epi32(head, 31), _mm256_xor_si256(_mm256_cmpeq_epi32(day, before), _mm256_set1_epi32(-1)));
+        let new = _mm256_movemask_ps(_mm256_castsi256_ps(head)) as u32 & real;
+        let open = _mm256_movemask_ps(_mm256_castsi256_ps(opens)) as u32 & real;
+        let row = _mm256_add_epi32(_mm256_set1_epi32(rows as i32), _mm256_cvtepu8_epi32(_mm_loadl_epi64(BEFORE.as_ptr().add(open as usize) as *const __m128i)));
+        _mm256_storeu_si256(run_session.add(runs) as *mut __m256i, front8(number, new));
+        _mm256_storeu_si256(run_row.add(runs) as *mut __m256i, front8(row, new));
+        _mm256_storeu_si256(row_session.add(rows) as *mut __m256i, front8(number, open));
+        _mm256_storeu_si256(row_event.add(rows) as *mut __m256i, front8(_mm256_and_si256(head, low), open));
+        _mm256_storeu_si256(row_of.add(at) as *mut __m256i, _mm256_sub_epi32(_mm256_sub_epi32(row, one), opens));
+        number = _mm256_add_epi32(number, eight);
+        runs += new.count_ones() as usize;
+        rows += open.count_ones() as usize;
+        at += 8;
+    }
+    (rows, runs)
 }
 
 #[inline(always)]
@@ -808,17 +895,25 @@ unsafe fn aliases(who: *const u32, from: usize, to: usize) -> u32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn gather(best: *const Rec, who: *const u32, ts: *const u32, slots: *const u32, from: usize, to: usize, ids: &mut Vec<u32>, events: &mut Vec<u64>) {
+unsafe fn gather(best: *const Rec, who: *const u32, ts: *const u32, buys: *const u64, from: usize, to: usize, ids: &mut Vec<u32>, events: &mut Vec<u64>) {
     ids.extend_from_slice(std::slice::from_raw_parts(who.add(from), to - from));
-    events.extend((from..to).map(|at| u64::from(*ts.add(at)) << 32 | (*best.add(*slots.add(at) as usize)).b & 0x1FFF_FFFF));
+    let had = events.len();
+    events.extend((from..to).map(|at| u64::from(*ts.add(at)) << 32));
+    let mut buy = buys;
+    while ((*buy as u32) as usize) < from {
+        buy = buy.add(1);
+    }
+    while ((*buy as u32) as usize) < to {
+        *events.get_unchecked_mut(had + (*buy as u32) as usize - from) |= (*best.add((*buy >> 32) as usize)).b & 0x1FFF_FFFF;
+        buy = buy.add(1);
+    }
 }
 
 #[derive(Default)]
 struct Table {
     who: Vec<u32>,
     ts: Vec<u32>,
-    slots: Vec<u32>,
-    buys: Vec<u8>,
+    buys: Vec<u64>,
     first: Vec<u32>,
     start: Vec<u32>,
     day: Vec<u32>,
@@ -840,8 +935,7 @@ impl Table {
         Table {
             who: vec![0; size],
             ts: vec![0; size],
-            slots: vec![0; size],
-            buys: vec![0; BUCKET / 8 + 8],
+            buys: vec![0; size],
             first: vec![0; size],
             start: vec![0; size],
             day: vec![0; size],
@@ -862,48 +956,88 @@ impl Table {
 
 impl<'a> Local<'a> {
     fn write_file(&mut self) {
-        if self.rows == 0 {
-            return;
-        }
-        let column = &mut self.columns[5];
-        column.present.clear();
-        column.present.resize(self.rows.div_ceil(8), 0);
-        column.values.clear();
-        for (row, &category) in self.categories.iter().enumerate() {
-            if category != NO_CATEGORY {
-                column.present[row / 8] |= 1 << (row % 8);
-                column.values.push(category);
+        for (buying, sheet) in self.sheets.iter_mut().enumerate() {
+            let rows = sheet.rows;
+            if rows == 0 {
+                continue;
             }
-        }
-        let name = format!("dense-{}-{}.parquet", self.thread, self.files);
-        pqw::write(&self.output.join(concat!("use", "r_d", "ail", "y")).join(name), &T_ONE, &self.columns, self.rows).unwrap();
-        self.files += 1;
-        self.rows = 0;
-        for column in &mut self.columns {
+            let columns = &mut sheet.columns;
+            let events = &mut columns[3];
+            events.values.clear();
+            if sheet.events.iter().all(|&count| count < 256) {
+                events.mode = Mode::Bytes;
+                events.values.extend(sheet.events.iter().map(|&count| count as u8));
+            } else {
+                events.mode = Mode::Plain;
+                for &count in &sheet.events {
+                    events.values.extend_from_slice(&count.to_le_bytes());
+                }
+            }
+            let column = &mut columns[5];
+            column.present.clear();
+            column.present.resize(rows.div_ceil(8), 0);
             column.values.clear();
+            if buying == 1 {
+                for (row, &category) in sheet.categories.iter().enumerate() {
+                    if category != NO_CATEGORY {
+                        column.present[row / 8] |= 1 << (row % 8);
+                        column.values.push(category);
+                    }
+                }
+            } else {
+                columns[4].values.clear();
+                columns[4].push_run(rows, 0);
+            }
+            let name = format!("dense-{}-{}-{buying}.parquet", self.thread, self.files);
+            pqw::write(&self.output.join(concat!("use", "r_d", "ail", "y")).join(name), &T_ONE, columns, rows).unwrap();
+            sheet.rows = 0;
+            for column in columns.iter_mut() {
+                column.values.clear();
+            }
+            sheet.events.clear();
+            sheet.categories.clear();
+            columns[0].dictionary.clear();
+            columns[0].dictionary_len = 0;
         }
-        self.categories.clear();
-        self.columns[0].dictionary.clear();
-        self.columns[0].dictionary_len = 0;
+        self.files += 1;
     }
 
     #[inline(always)]
-    fn name(&mut self, id: u64) -> usize {
+    fn name(&mut self, id: u64, rows: [usize; 2]) {
+        let number = scramble(id, self.stage.shared.plan.user_key);
         let mut text = [0u8; 16];
-        let len = encode(b'u', scramble(id, self.stage.shared.plan.user_key), &mut text);
-        let column = &mut self.columns[0];
-        column.dictionary.extend_from_slice(&(len as u32).to_le_bytes());
-        column.dictionary.extend_from_slice(&text[..len]);
-        column.dictionary_len += 1;
-        column.dictionary_len - 1
+        let mut len = 13;
+        if number >= EIGHT_DIGITS {
+            let (high, low) = (number / (1296 * 1296), number % (1296 * 1296));
+            let pair = |value: u64| u64::from(PAIRS[value as usize]);
+            let digits = pair(high / 1296) | pair(high % 1296) << 16 | pair(low / 1296) << 32 | pair(low % 1296) << 48;
+            text[..4].copy_from_slice(&9u32.to_le_bytes());
+            text[4] = b'u';
+            text[5..13].copy_from_slice(&digits.to_le_bytes());
+        } else {
+            let mut id = [0u8; 16];
+            let digits = encode(b'u', number, &mut id);
+            text[..4].copy_from_slice(&(digits as u32).to_le_bytes());
+            text[4..4 + digits].copy_from_slice(&id[..digits]);
+            len = 4 + digits;
+        }
+        for (sheet, rows) in self.sheets.iter_mut().zip(rows) {
+            if rows > 0 {
+                let column = &mut sheet.columns[0];
+                column.dictionary.reserve(16);
+                unsafe {
+                    let at = column.dictionary.as_mut_ptr().add(column.dictionary.len());
+                    std::ptr::copy_nonoverlapping(text.as_ptr(), at, 16);
+                    column.dictionary.set_len(column.dictionary.len() + len);
+                }
+                column.dictionary_len += 1;
+                column.push_run(rows, column.dictionary_len - 1);
+            }
+        }
     }
 
     #[inline(always)]
     fn emit(&mut self, row: &Row) {
-        self.columns[1].values.push(row.day as u8);
-        self.columns[2].values.push(row.sessions as u8);
-        self.columns[3].push_i32(row.events as i32);
-        self.columns[4].push_i64(row.revenue);
         let mut top = u32::MAX;
         let mut best = 0;
         for &category in &self.category_used {
@@ -914,8 +1048,15 @@ impl<'a> Local<'a> {
             }
         }
         self.category_used.clear();
-        self.categories.push(top as u8);
-        self.rows += 1;
+        let sheet = &mut self.sheets[usize::from(row.revenue != 0)];
+        sheet.columns[1].values.push(row.day as u8);
+        sheet.columns[2].values.push(row.sessions as u8);
+        sheet.events.push(row.events);
+        if row.revenue != 0 {
+            sheet.columns[4].push_i64(row.revenue);
+            sheet.categories.push(top as u8);
+        }
+        sheet.rows += 1;
     }
 
     #[inline(always)]
@@ -952,14 +1093,15 @@ impl<'a> Local<'a> {
         let t = &mut table;
         let (first, start, day_of, campaign_of, row_of) =
             (t.first.as_mut_ptr(), t.start.as_mut_ptr(), t.day.as_mut_ptr(), t.campaign.as_mut_ptr(), t.row.as_mut_ptr());
-        let (who, ts, slots) = (t.who.as_mut_ptr().add(8), t.ts.as_mut_ptr().add(8), t.slots.as_mut_ptr().add(8));
+        let (who, ts, buys) = (t.who.as_mut_ptr().add(8), t.ts.as_mut_ptr().add(8), t.buys.as_mut_ptr());
         let bought = t.bought.as_mut_ptr();
         let (row_session, row_event, row_revenue, row_category) =
             (t.row_session.as_mut_ptr(), t.row_event.as_mut_ptr(), t.row_revenue.as_mut_ptr(), t.row_category.as_mut_ptr());
         let (run_session, run_row, run_name) = (t.run_session.as_mut_ptr(), t.run_row.as_mut_ptr(), t.run_name.as_mut_ptr());
 
-        let (count, foreign) = pack(best, marked, who, ts, slots, t.buys.as_mut_ptr());
-        if foreign {
+        self.others.clear();
+        let count = pack(best, marked, who, ts, buys, &mut self.others);
+        if !self.others.is_empty() {
             self.foreign_events(marked);
         }
         step(&mut clock, 1);
@@ -967,26 +1109,20 @@ impl<'a> Local<'a> {
             self.table = table;
             return;
         }
-        let (sessions, purchases, back) = sessions_of(who, ts, count, t.buys.as_ptr(), first, start, bought);
+        let (sessions, purchases, back) = sessions_of(who, ts, count, buys, first, start, bought);
         *first.add(sessions) = count as u32 | TOP;
 
         step(&mut clock, 2);
-        let (mut rows, mut runs) = (0usize, 0usize);
-        let mut last_day = u32::MAX;
-        for session in 0..sessions {
-            let head = *first.add(session);
-            let day = ((context.day_offset + u64::from(*start.add(session))) / DAY as u64) as u32;
-            *day_of.add(session) = day;
-            *campaign_of.add(session) = organic;
-            *run_session.add(runs) = session as u32;
-            *run_row.add(runs) = rows as u32;
-            runs += (head >> 31) as usize;
-            *row_session.add(rows) = session as u32;
-            *row_event.add(rows) = head & LOW;
-            rows += (head >> 31 | u32::from(day != last_day)) as usize;
-            *row_of.add(session) = rows as u32 - 1;
-            last_day = day;
-        }
+        let (rows, runs) = rows_of(
+            first,
+            start,
+            sessions,
+            context.day_offset as u32,
+            organic,
+            [day_of, campaign_of, row_of],
+            [run_session, run_row],
+            [row_session, row_event],
+        );
         *run_session.add(runs) = sessions as u32;
         *run_row.add(runs) = rows as u32;
         *row_session.add(rows) = sessions as u32;
@@ -1007,12 +1143,12 @@ impl<'a> Local<'a> {
             if run == 0 || run + 1 == runs {
                 let edges = &mut self.edges;
                 edges.runs.push((part as u32 * 2 + u32::from(run > 0), user, edges.who.len(), events));
-                gather(best, who, ts, slots, a, e, &mut edges.who, &mut edges.events);
+                gather(best, who, ts, buys, a, e, &mut edges.who, &mut edges.events);
                 step(&mut inner, 10);
             } else if unsorted {
                 self.who.clear();
                 self.events.clear();
-                gather(best, who, ts, slots, a, e, &mut self.who, &mut self.events);
+                gather(best, who, ts, buys, a, e, &mut self.who, &mut self.events);
                 self.run(user as usize, 0, events);
                 step(&mut inner, 11);
             } else {
@@ -1021,7 +1157,7 @@ impl<'a> Local<'a> {
                 if name == NONE {
                     self.who.clear();
                     self.events.clear();
-                    gather(best, who, ts, slots, a, e, &mut self.who, &mut self.events);
+                    gather(best, who, ts, buys, a, e, &mut self.who, &mut self.events);
                     self.side(user as usize, 0, events);
                     step(&mut inner, 13);
                 } else if *stage.starts.0.add(user as usize) != *stage.starts.0.add(user as usize + 1) {
@@ -1050,7 +1186,7 @@ impl<'a> Local<'a> {
         let mut sum_row = [u32::MAX; 32];
         let (mut last_session, mut last_row, mut top) = (u32::MAX, u32::MAX, 0i64);
         for at in 0..purchases {
-            let payload = (*best.add(*slots.add(*bought.add(at) as u32 as usize) as usize)).b as u32 & 0x1FFF_FFFF;
+            let payload = (*best.add(*bought.add(at) as u32 as usize)).b as u32 & 0x1FFF_FFFF;
             let (category, price) = ((payload >> 24) as usize, i64::from(payload & 0x00FF_FFFF));
             let session = (*bought.add(at) >> 32) as u32;
             let cell = bought_by.add((*campaign_of.add(session as usize) * days + *day_of.add(session as usize)) as usize);
@@ -1071,47 +1207,59 @@ impl<'a> Local<'a> {
         }
 
         step(&mut clock, 6);
+        let had = [self.sheets[0].rows, self.sheets[1].rows];
+        for sheet in &mut self.sheets {
+            sheet.columns[1].values.reserve(rows);
+            sheet.columns[2].values.reserve(rows);
+            sheet.events.reserve(rows);
+        }
+        self.sheets[1].columns[4].values.reserve(rows * 8);
+        self.sheets[1].categories.reserve(rows);
+        let out = |sheet: &mut Sheet, had: usize| (sheet.columns[1].values.as_mut_ptr().add(had), sheet.columns[2].values.as_mut_ptr().add(had), sheet.events.as_mut_ptr().add(had));
+        let (plain, buying) = (out(&mut self.sheets[0], had[0]), out(&mut self.sheets[1], had[1]));
+        let (revenue_out, category_out) = (self.sheets[1].columns[4].values.as_mut_ptr().add(had[1] * 8) as *mut i64, self.sheets[1].categories.as_mut_ptr().add(had[1]));
+        let before = row_of;
+        let (mut kept, mut bought_rows) = (0usize, 0usize);
+        for row in 0..rows {
+            let session = *row_session.add(row) as usize;
+            let (day, sessions, events) = (*day_of.add(session) as u8, (*row_session.add(row + 1) - session as u32) as u8, *row_event.add(row + 1) - *row_event.add(row));
+            let revenue = *row_revenue.add(row);
+            let plain_at = kept - bought_rows;
+            *plain.0.add(plain_at) = day;
+            *plain.1.add(plain_at) = sessions;
+            *plain.2.add(plain_at) = events;
+            *buying.0.add(bought_rows) = day;
+            *buying.1.add(bought_rows) = sessions;
+            *buying.2.add(bought_rows) = events;
+            revenue_out.add(bought_rows).write_unaligned(revenue);
+            *category_out.add(bought_rows) = *row_category.add(row);
+            *before.add(row) = bought_rows as u32;
+            let keep = usize::from(*campaign_of.add(session) != unfinished);
+            kept += keep;
+            bought_rows += keep & usize::from(revenue != 0);
+        }
+        *before.add(rows) = bought_rows as u32;
+        for (buying, sheet) in self.sheets.iter_mut().enumerate() {
+            let rows = had[buying] + if buying == 1 { bought_rows } else { kept - bought_rows };
+            sheet.columns[1].values.set_len(rows);
+            sheet.columns[2].values.set_len(rows);
+            sheet.events.set_len(rows);
+            sheet.rows = rows;
+        }
+        self.sheets[1].columns[4].values.set_len(self.sheets[1].rows * 8);
+        self.sheets[1].categories.set_len(self.sheets[1].rows);
+        step(&mut clock, 8);
         for run in 0..runs {
             let name = *run_name.add(run);
             if name != NONE {
-                let place = self.name(name);
-                self.columns[0].push_run((*run_row.add(run + 1) - *run_row.add(run)) as usize, place);
+                let (from, to) = (*run_row.add(run) as usize, *run_row.add(run + 1) as usize);
+                let with = (*before.add(to) - *before.add(from)) as usize;
+                self.name(name, [to - from - with, with]);
             }
         }
         step(&mut clock, 7);
-        let had = self.rows;
-        self.columns[1].values.reserve(rows);
-        self.columns[2].values.reserve(rows);
-        self.columns[3].values.reserve(rows * 4);
-        self.columns[4].values.reserve(rows * 8);
-        self.categories.reserve(rows);
-        let (day_out, sessions_out, events_out, revenue_out, category_out) = (
-            self.columns[1].values.as_mut_ptr().add(had),
-            self.columns[2].values.as_mut_ptr().add(had),
-            self.columns[3].values.as_mut_ptr().add(had * 4) as *mut u32,
-            self.columns[4].values.as_mut_ptr().add(had * 8) as *mut i64,
-            self.categories.as_mut_ptr().add(had),
-        );
-        let mut kept = 0;
-        for row in 0..rows {
-            let session = *row_session.add(row) as usize;
-            *day_out.add(kept) = *day_of.add(session) as u8;
-            *sessions_out.add(kept) = (*row_session.add(row + 1) - session as u32) as u8;
-            events_out.add(kept).write_unaligned(*row_event.add(row + 1) - *row_event.add(row));
-            revenue_out.add(kept).write_unaligned(*row_revenue.add(row));
-            *category_out.add(kept) = *row_category.add(row);
-            kept += usize::from(*campaign_of.add(session) != unfinished);
-        }
-        let rows = had + kept;
-        self.columns[1].values.set_len(rows);
-        self.columns[2].values.set_len(rows);
-        self.columns[3].values.set_len(rows * 4);
-        self.columns[4].values.set_len(rows * 8);
-        self.categories.set_len(rows);
-        self.rows = rows;
         self.table = table;
-        step(&mut clock, 8);
-        if self.rows >= FILE_ROWS {
+        if self.sheets[0].rows.max(self.sheets[1].rows) >= FILE_ROWS {
             self.write_file();
         }
         step(&mut clock, 9);
@@ -1120,8 +1268,8 @@ impl<'a> Local<'a> {
     #[cold]
     #[inline(never)]
     unsafe fn foreign_events(&mut self, marked: u64) {
-        for low in 0..BUCKET {
-            let record = self.best[low];
+        for at in 0..self.others.len() * 4 {
+            let record = self.best[self.others[at / 4] as usize * 4 + at % 4];
             let stamp = record.a >> 32 & INVALID;
             if record.b >> 50 == marked && stamp != INVALID && record.a as u32 & FOREIGN != 0 {
                 let person = self.stage.person(record.a as u32);
@@ -1130,14 +1278,105 @@ impl<'a> Local<'a> {
         }
     }
 
-    unsafe fn job(&mut self, job: &Job, edges: &[Edges]) {
-        self.who.clear();
-        self.events.clear();
-        for &(thread, from, len) in &job.pieces {
-            self.who.extend_from_slice(&edges[thread].who[from..from + len]);
-            self.events.extend_from_slice(&edges[thread].events[from..from + len]);
+    unsafe fn job_claim(&mut self, job: &Job, edges: &[Edges], odd: &OddUsers) -> u64 {
+        let user = job.user as usize;
+        let state = self.stage.shared.state.get_unchecked(user);
+        let name = self.job_name(job, edges, odd);
+        if name == NONE {
+            self.who.clear();
+            self.events.clear();
+            for &(thread, from, len) in &job.pieces {
+                self.who.extend_from_slice(&edges[thread].who[from..from + len]);
+                self.events.extend_from_slice(&edges[thread].events[from..from + len]);
+            }
+            self.side(user, 0, job.events);
+        } else if state.fetch_or(LOCAL, Relaxed) & (LOCAL | SIDE) != 0 {
+            VIOLATION.store(true, Relaxed);
         }
-        self.run(job.user as usize, 0, job.events);
+        name
+    }
+
+    unsafe fn job_name(&mut self, job: &Job, edges: &[Edges], odd: &OddUsers) -> u64 {
+        let stage = self.stage;
+        let shared = stage.shared;
+        let user = job.user as usize;
+        let state = shared.state.get_unchecked(user).load(Relaxed);
+        if state & LINKED_OUT != 0 || state & (ODD | SIDE) == ODD | SIDE {
+            return NONE;
+        }
+        let first = edges[job.pieces[0].0].who[job.pieces[0].1];
+        let mut seen = 0u32;
+        let mut see = |who: u32| seen |= 1 << (who & 511).min(8);
+        for &(thread, from, len) in &job.pieces {
+            for &who in &edges[thread].who[from..from + len] {
+                see(who);
+            }
+        }
+        for click in stage.clicks_of(user) {
+            see(click.a as u32);
+        }
+        if let Some(odd) = odd.get(&job.user).filter(|_| state & ODD != 0) {
+            for &(who, _) in &odd.events {
+                see(who);
+            }
+            for &(who, _) in &odd.clicks {
+                see(who);
+            }
+        }
+        self.person(user, first, seen)
+    }
+
+    unsafe fn job_sessions(&mut self, job: &Job, edges: &[Edges], name: u64, odd: &OddUsers) {
+        let user = job.user as usize;
+        let stage = self.stage;
+        let odd = if stage.shared.state[user].load(Relaxed) & ODD != 0 { odd.get(&job.user) } else { None };
+        let room = job.events + odd.map_or(0, |odd| odd.events.len());
+        if room > self.long.1 {
+            const HUGE: usize = 2 << 20;
+            let bytes = (room * 8).next_multiple_of(HUGE);
+            self.long = (super::mem::zeroed(bytes, false) as *mut u64, bytes / 8);
+        }
+        let events = self.long.0;
+        let mut count = 0;
+        for &(thread, from, len) in &job.pieces {
+            std::ptr::copy_nonoverlapping(edges[thread].events.as_ptr().add(from), events.add(count), len);
+            count += len;
+        }
+        let mut clicks = self.clicks_in_order(user);
+        if let Some(odd) = odd {
+            for &(_, event) in &odd.events {
+                let mut at = count;
+                while at > 0 && *events.add(at - 1) >> 32 > event >> 32 {
+                    at -= 1;
+                }
+                std::ptr::copy(events.add(at), events.add(at + 1), count - at);
+                *events.add(at) = event;
+                count += 1;
+            }
+            if !odd.clicks.is_empty() {
+                let mut merged = clicks.to_vec();
+                let mut ids = vec![0u64; merged.len()];
+                let id_of = |click: &Rec, id: u64| {
+                    if id != 0 {
+                        return id;
+                    }
+                    let mut text = [0u8; 16];
+                    let len = encode(b'k', click.b & MASK, &mut text);
+                    keys::pack(text.as_ptr(), len)
+                };
+                for &(who, click) in &odd.clicks {
+                    let mut at = merged.partition_point(|other| ((other.a >> 32) as u32) < click.ts);
+                    while at < merged.len() && (merged[at].a >> 32) as u32 == click.ts && !keys::compare(id_of(&merged[at], ids[at]), click.id).is_lt() {
+                        at += 1;
+                    }
+                    merged.insert(at, Rec { a: u64::from(who) | u64::from(click.ts) << 32, b: u64::from(click.campaign) << 40 });
+                    ids.insert(at, click.id);
+                }
+                self.merged = merged;
+                clicks = std::slice::from_raw_parts(self.merged.as_ptr(), self.merged.len());
+            }
+        }
+        self.claimed(name, events, count, clicks);
     }
 
     #[inline(never)]
@@ -1150,23 +1389,28 @@ impl<'a> Local<'a> {
         if name == NONE {
             return self.side(user, from, to);
         }
+        let clicks = self.clicks_in_order(user);
+        self.claimed(name, self.events.as_ptr().add(from), to - from, clicks);
+    }
+
+    #[inline(always)]
+    unsafe fn claimed(&mut self, name: u64, events: *const u64, count: usize, clicks: &[Rec]) {
         let mut sorted = true;
-        for at in from + 1..to {
-            sorted &= *self.events.get_unchecked(at - 1) >> 32 <= *self.events.get_unchecked(at) >> 32;
+        for at in 1..count {
+            sorted &= *events.add(at - 1) >> 32 <= *events.add(at) >> 32;
         }
         let events: &[u64] = if sorted {
-            std::slice::from_raw_parts(self.events.as_ptr().add(from), to - from)
+            std::slice::from_raw_parts(events, count)
         } else {
             self.sorted.clear();
-            self.sorted.extend_from_slice(std::slice::from_raw_parts(self.events.as_ptr().add(from), to - from));
+            self.sorted.extend_from_slice(std::slice::from_raw_parts(events, count));
             self.sorted.sort_unstable_by_key(|event| event >> 32);
-            std::slice::from_raw_parts(self.sorted.as_ptr(), to - from)
+            std::slice::from_raw_parts(self.sorted.as_ptr(), count)
         };
-        let place = self.name(name);
-        let had = self.rows;
-        self.sessions(events, self.stage.clicks_of(user));
-        self.columns[0].push_run(self.rows - had, place);
-        if self.rows >= FILE_ROWS {
+        let had = [self.sheets[0].rows, self.sheets[1].rows];
+        self.sessions(events, clicks);
+        self.name(name, [self.sheets[0].rows - had[0], self.sheets[1].rows - had[1]]);
+        if self.sheets[0].rows.max(self.sheets[1].rows) >= FILE_ROWS {
             self.write_file();
         }
     }
@@ -1220,21 +1464,57 @@ impl<'a> Local<'a> {
         if used >> 8 != 0 {
             return NONE;
         }
-        let component = u32::from(shared.component(user, first & 511));
+        use std::arch::x86_64::_pdep_u64;
+        let adjacent = shared.adjacent.get_unchecked(user).load(Relaxed);
+        let alias = first & 7;
+        let mut component = 0;
+        if adjacent >> (8 * alias) & 0xFF != 0 {
+            component = 1u64 << alias;
+            loop {
+                let rows = adjacent & _pdep_u64(component, 0x0101_0101_0101_0101) * 255;
+                let reached = component | (0..8).fold(0, |all, row| all | rows >> (8 * row)) & 0xFF;
+                if reached == component {
+                    break;
+                }
+                component = reached;
+            }
+        }
+        let component = component as u32;
         if used & !component != 0 && used & (used - 1) != 0 {
             return NONE;
         }
-        if component != 0 {
-            shared.smallest(user, component as u8)
-        } else {
-            u64::from(first)
+        if component == 0 {
+            return u64::from(first);
         }
+        let base = (user as u64) << ALIAS_BITS;
+        let (mut least, mut name) = (u64::MAX, 0);
+        let mut aliases = component;
+        while aliases != 0 {
+            let id = base | u64::from(aliases.trailing_zeros());
+            let number = scramble(id, shared.plan.user_key);
+            (least, name) = if number < least { (number, id) } else { (least, name) };
+            aliases &= aliases - 1;
+        }
+        if least >= EIGHT_DIGITS {
+            return name;
+        }
+        shared.smallest(user, component as u8)
+    }
+
+    #[inline(always)]
+    unsafe fn clicks_in_order(&mut self, user: usize) -> &'a [Rec] {
+        let stage = self.stage;
+        let (from, to) = (*stage.starts.0.add(user) as usize, *stage.starts.0.add(user + 1) as usize);
+        if to - from > 1 {
+            sort_clicks(std::slice::from_raw_parts_mut(stage.clicks.0.add(from), to - from), &mut self.keys, &mut self.copy);
+        }
+        std::slice::from_raw_parts(stage.clicks.0.add(from), to - from)
     }
 
     #[inline(always)]
     unsafe fn credit(&mut self, user: usize, table: &mut Table, from: usize, to: usize) {
         use std::arch::x86_64::*;
-        let records = self.stage.clicks_of(user);
+        let records = self.clicks_in_order(user);
         if records.len() > 16 {
             return self.credit_many(records, table, from, to);
         }
@@ -1500,16 +1780,18 @@ impl<'a> Local<'a> {
         let stage = self.stage;
         for user in users {
             let clicks = stage.clicks_of(user);
-            if clicks.is_empty() || stage.shared.state[user].load(Relaxed) & LOCAL != 0 {
+            let state = stage.shared.state[user].load(Relaxed);
+            if clicks.is_empty() || state & LOCAL != 0 || state & (SIDE | ODD | LINKED_OUT) == 0 {
                 continue;
             }
-            let (mut last, mut person) = (u32::MAX, 0);
+            let mut people = [(u32::MAX, 0u64); 8];
             for click in clicks {
                 let who = click.a as u32;
-                if who != last {
-                    last = who;
-                    person = stage.shared.person(stage.links, who);
+                let slot = &mut people[(who & 7) as usize];
+                if slot.0 != who {
+                    *slot = (who, stage.shared.person(stage.links, who));
                 }
+                let person = slot.1;
                 let mut text = [0u8; 16];
                 let len = encode(b'k', click.b & MASK, &mut text);
                 let id = keys::pack(text.as_ptr(), len);
@@ -1518,17 +1800,7 @@ impl<'a> Local<'a> {
         }
     }
 }
-unsafe fn group_clicks(
-    parsed: &[Parse],
-    part: usize,
-    base: usize,
-    clicks: &Raw<Rec>,
-    starts: &Raw<u32>,
-    counts: &mut Vec<u32>,
-    keys: &mut Vec<u64>,
-    copy: &mut Vec<Rec>,
-    large: &std::sync::Mutex<Vec<(usize, usize)>>,
-) {
+unsafe fn group_clicks(parsed: &[Parse], part: usize, base: usize, clicks: &Raw<Rec>, starts: &Raw<u32>, counts: &mut Vec<u32>) {
     let users = 1usize << USER_BITS;
     let first = part << USER_BITS;
     counts.clear();
@@ -1555,19 +1827,7 @@ unsafe fn group_clicks(
             }
         });
     }
-    let mut from = base;
-    for &to in counts.iter() {
-        let to = to as usize;
-        if to - from > MANY_CLICKS {
-            large.lock().unwrap().push((from, to));
-        } else if to - from > 1 {
-            sort_clicks(std::slice::from_raw_parts_mut(clicks.0.add(from), to - from), keys, copy);
-        }
-        from = to;
-    }
 }
-
-const MANY_CLICKS: usize = 4096;
 
 fn sort_clicks(clicks: &mut [Rec], keys: &mut Vec<u64>, copy: &mut Vec<Rec>) {
     let before = |x: &Rec, y: &Rec| {
@@ -1590,11 +1850,12 @@ fn sort_clicks(clicks: &mut [Rec], keys: &mut Vec<u64>, copy: &mut Vec<Rec>) {
         #[repr(align(32))]
         struct Lanes([u32; 32]);
         let mut stamps = Lanes([i32::MAX as u32; 32]);
-        let mut copy = [EMPTY; 32];
+        let mut copy = [std::mem::MaybeUninit::<Rec>::uninit(); 32];
         for (place, click) in clicks.iter().enumerate() {
             stamps.0[place] = (click.a >> 32) as u32;
-            copy[place] = *click;
+            copy[place].write(*click);
         }
+        let copy = unsafe { &*(copy.as_ptr() as *const [Rec; 32]) };
         let groups = clicks.len().div_ceil(8);
         let mut ties = false;
         unsafe {
@@ -1636,30 +1897,47 @@ fn sort_clicks(clicks: &mut [Rec], keys: &mut Vec<u64>, copy: &mut Vec<Rec>) {
     }
 }
 
-fn row_columns(context: &Context) -> Vec<Column> {
-    let mut columns: Vec<Column> = (0..6).map(|_| Column::default()).collect();
-    columns[0].mode = Mode::Runs;
-    for (column, values) in [(1, context.days), (2, 256), (5, context.categories.len())] {
-        columns[column].mode = Mode::Bytes;
-        columns[column].dictionary_len = values;
+struct Sheet {
+    rows: usize,
+    columns: Vec<Column>,
+    events: Vec<u32>,
+    categories: Vec<u8>,
+}
+
+impl Sheet {
+    fn new(context: &Context, buying: bool) -> Sheet {
+        let mut columns: Vec<Column> = (0..6).map(|_| Column::default()).collect();
+        columns[0].mode = Mode::Runs;
+        for (column, values) in [(1, context.days), (2, 256), (3, 256), (5, context.categories.len())] {
+            columns[column].mode = Mode::Bytes;
+            columns[column].dictionary_len = values;
+        }
+        for day in 0..context.days {
+            columns[1].dictionary.extend_from_slice(&(context.first_day + day as i32).to_le_bytes());
+        }
+        for count in 0..256i32 {
+            columns[2].dictionary.extend_from_slice(&count.to_le_bytes());
+            columns[3].dictionary.extend_from_slice(&count.to_le_bytes());
+        }
+        if !buying {
+            columns[4].mode = Mode::Runs;
+            columns[4].dictionary = 0i64.to_le_bytes().to_vec();
+            columns[4].dictionary_len = 1;
+        }
+        for category in &context.categories {
+            columns[5].dictionary.extend_from_slice(&(category.len() as u32).to_le_bytes());
+            columns[5].dictionary.extend_from_slice(category);
+        }
+        Sheet { rows: 0, columns, events: Vec::new(), categories: Vec::new() }
     }
-    for day in 0..context.days {
-        columns[1].dictionary.extend_from_slice(&(context.first_day + day as i32).to_le_bytes());
-    }
-    for sessions in 0..256i32 {
-        columns[2].dictionary.extend_from_slice(&sessions.to_le_bytes());
-    }
-    for category in &context.categories {
-        columns[5].dictionary.extend_from_slice(&(category.len() as u32).to_le_bytes());
-        columns[5].dictionary.extend_from_slice(category);
-    }
-    columns
 }
 
 fn remove_output(output: &Path) {
     let folder = output.join(concat!("use", "r_d", "ail", "y"));
     for entry in fs::read_dir(&folder).into_iter().flatten().flatten() {
-        if entry.file_name().to_string_lossy().starts_with("dense-") {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("dense-") || name.starts_with("part-") {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -1743,7 +2021,7 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
         return refuse("too many categories or campaigns");
     }
     let estimate = event_bytes / 80;
-    context.person_bits = (estimate / 160_000).max(1).next_power_of_two().trailing_zeros().clamp(4, 11);
+    context.person_bits = (estimate / 1_000_000).max(1).next_power_of_two().trailing_zeros().clamp(4, 11);
     context.event_bits = 4;
     let context = &context;
     let users = plan.users;
@@ -1914,86 +2192,76 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
     };
     unsafe { *stage.starts.0.add(users) = click_total as u32 };
     let stage = &stage;
-    let (next, next_large) = (AtomicUsize::new(0), AtomicUsize::new(0));
-    let large = std::sync::Mutex::new(Vec::new());
-    let barrier = Barrier::new(threads);
-    {
-        {
-            pool::run(threads, |_| {
-                let (mut counts, mut keys, mut copy) = (Vec::new(), Vec::new(), Vec::new());
-                loop {
-                    let part = next.fetch_add(1, Relaxed);
-                    if part >= click_parts {
-                        break;
-                    }
-                    unsafe { group_clicks(parsed, part, bases[part], &stage.clicks, &stage.starts, &mut counts, &mut keys, &mut copy, &large) };
-                }
-                barrier.wait();
-                loop {
-                    let Some(&(from, to)) = large.lock().unwrap().get(next_large.fetch_add(1, Relaxed)) else { break };
-                    sort_clicks(unsafe { std::slice::from_raw_parts_mut(stage.clicks.0.add(from), to - from) }, &mut keys, &mut copy);
-                }
-            });
+    let next = AtomicUsize::new(0);
+    pool::run(threads, |_| {
+        let mut counts = Vec::new();
+        loop {
+            let part = next.fetch_add(1, Relaxed);
+            if part >= click_parts {
+                break;
+            }
+            unsafe { group_clicks(parsed, part, bases[part], &stage.clicks, &stage.starts, &mut counts) };
         }
-       }
+    });
     lap("dense: clicks grouped");
 
     let campaigns = context.campaign_ids.len();
     let side_parts = 1usize << context.person_bits;
     let odd = &odd;
-    let mut locals: Vec<Local> = (0..threads)
-        .map(|thread| unsafe {
-            let arena = Arena::leak((record_bytes / 16).max(1 << 22));
-            Local {
-                stage,
-                output,
-                thread,
-                files: 0,
-                rows: 0,
-                columns: row_columns(context),
-                tallies: vec![Tally::default(); (campaigns + 1) * context.days],
-                assisted: vec![0; (campaigns + 1) * context.days + 16],
-                categories: Vec::new(),
-                credited: vec![0; (campaigns + 2) * context.days],
-                bought: vec![[0; 2]; (campaigns + 2) * context.days],
-                table: Table::default(),
-                best: Vec::new(),
-                mark: MARKS + 1,
-                who: Vec::new(),
-                events: Vec::new(),
-                sorted: Vec::new(),
-                assists: Vec::with_capacity(1 << 12),
-                before: Vec::new(),
-                edges: Edges::default(),
-                active: Vec::new(),
-                active_count: vec![0; campaigns],
-                active_at: vec![0; campaigns],
-                category_sum: vec![0; context.categories.len()],
-                category_used: Vec::new(),
-                side_events: Scatter::new(arena, side_parts),
-                side_clicks: Scatter::new(arena, side_parts),
-                person_shift: 64 - context.person_bits,
-            }
-        })
-        .collect();
     let next = AtomicUsize::new(0);
-    {
+    let locals: Vec<Local> = {
         {
-            let next = &next;
-            pool::each(&mut locals, move |_, local| unsafe {
-                local.best = vec![UNUSED; BUCKET];
-                local.table = Table::new();
-                loop {
-                    let part = next.fetch_add(1, Relaxed);
-                    if part >= buckets {
-                        break;
+            {
+                let next = &next;
+                pool::map(threads, move |thread| unsafe {
+                    let arena = Arena::leak((record_bytes / 16).max(1 << 22));
+                    let mut local = Local {
+                        stage,
+                        output,
+                        thread,
+                        files: 0,
+                        sheets: [Sheet::new(context, false), Sheet::new(context, true)],
+                        tallies: vec![Tally::default(); (campaigns + 1) * context.days],
+                        assisted: vec![0; (campaigns + 1) * context.days + 16],
+                        credited: vec![0; (campaigns + 2) * context.days],
+                        bought: vec![[0; 2]; (campaigns + 2) * context.days],
+                        table: Table::new(),
+                        best: vec![UNUSED; BUCKET],
+                        mark: MARKS + 1,
+                        others: Vec::new(),
+                        who: Vec::new(),
+                        events: Vec::new(),
+                        sorted: Vec::new(),
+                        assists: Vec::with_capacity(1 << 12),
+                        keys: Vec::new(),
+                        copy: Vec::new(),
+                        before: Vec::new(),
+                        edges: Edges { who: Vec::with_capacity(1 << 19), events: Vec::with_capacity(1 << 19), runs: Vec::new() },
+                        merged: Vec::new(),
+                        long: (std::ptr::null_mut(), 0),
+                        active: Vec::new(),
+                        active_count: vec![0; campaigns],
+                        active_at: vec![0; campaigns],
+                        category_sum: vec![0; context.categories.len()],
+                        category_used: Vec::new(),
+                        side_events: Scatter::new(arena, side_parts),
+                        side_clicks: Scatter::new(arena, side_parts),
+                        person_shift: 64 - context.person_bits,
+                    };
+                    loop {
+                        let part = next.fetch_add(1, Relaxed);
+                        if part >= buckets {
+                            break;
+                        }
+                        local.bucket(part);
                     }
-                    local.bucket(part);
-                }
-                steps_done();
-            });
+                    steps_done();
+                    local
+                })
+            }
         }
-    }
+    };
+    let mut locals = locals;
     lap("dense: buckets");
     if PROFILE && verbose {
         for (name, cycles) in STEPS.iter().zip(&CYCLES) {
@@ -2007,18 +2275,34 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
     let edges: Vec<Edges> = locals.iter_mut().map(|local| std::mem::take(&mut local.edges)).collect();
     let jobs = stitch(&edges);
     let (edges, jobs) = (&edges, &jobs);
-    let (next, next_users) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let mut odd_users = OddUsers::new();
+    for event in odd.iter().filter(|event| event.who & FOREIGN == 0) {
+        odd_users.entry(event.who >> ALIAS_BITS).or_default().events.push((event.who, event.stamp << 32 | u64::from(event.payload)));
+    }
+    for &(who, click) in parsed.iter().flat_map(|thread| &thread.odd_clicks).filter(|click| click.0 & FOREIGN == 0) {
+        odd_users.entry(who >> ALIAS_BITS).or_default().clicks.push((who, click));
+    }
+    let odd_users = &odd_users;
+    let taken = |who: u32| who & FOREIGN == 0 && shared.state[(who >> ALIAS_BITS) as usize].load(Relaxed) & LOCAL != 0;
+    let taken = &taken;
+    let names: Vec<AtomicU64> = jobs.iter().map(|_| AtomicU64::new(NONE)).collect();
+    let names = &names;
+    let mut sides: Vec<std::mem::MaybeUninit<Parsed>> = (0..threads).map(|_| std::mem::MaybeUninit::uninit()).collect();
+    let sides = Raw(sides.as_mut_ptr() as *mut Parsed);
+    let parts: std::sync::OnceLock<(Vec<(usize, usize)>, usize)> = std::sync::OnceLock::new();
+    let (next, next_users, next_job, next_part) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let barrier = Barrier::new(threads);
-    let results: Vec<(Vec<Tally>, Sendable<Parsed>)> = {
+    let results: Vec<(Vec<Tally>, Option<Vec<Tally>>)> = {
         {
             {
-                let (next, next_users, barrier) = (&next, &next_users, &barrier);
+                let (next, next_users, next_job, next_part, barrier, sides, parts) = (&next, &next_users, &next_job, &next_part, &barrier, &sides, &parts);
                 pool::consume(locals, move |_, mut local: Local| unsafe {
                     let thread = local.thread;
-                    while let Some(job) = jobs.get(next.fetch_add(1, Relaxed)) {
-                        local.job(job, edges);
+                    loop {
+                        let at = next.fetch_add(1, Relaxed);
+                        let Some(job) = jobs.get(at) else { break };
+                        names[at].store(local.job_claim(job, edges, odd_users), Relaxed);
                     }
-                    local.write_file();
                     barrier.wait();
                     const STEP: usize = 1 << 12;
                     loop {
@@ -2028,12 +2312,12 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                         }
                         local.leftover_clicks(from..from + STEP);
                     }
-                    for &(who, click) in &parsed[thread].odd_clicks {
+                    for &(who, click) in parsed[thread].odd_clicks.iter().filter(|click| !taken(click.0)) {
                         let person = stage.person(who);
                         local.side_click(person, click);
                     }
                     if thread == 0 {
-                        for event in odd.iter() {
+                        for event in odd.iter().filter(|event| !taken(event.who)) {
                             let person = stage.person(event.who);
                             local.side_event(person, event.stamp << 32 | u64::from(event.payload));
                         }
@@ -2041,14 +2325,52 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
                     local.side_events.finish();
                     local.side_clicks.finish();
                     let arena = local.side_events.arena();
-                    let side = Parsed { dedups: Scatter::new(arena, 1), events: local.side_events, clicks: local.side_clicks };
+                    let events = std::mem::replace(&mut local.side_events, Scatter::new(arena, 1));
+                    let clicks = std::mem::replace(&mut local.side_clicks, Scatter::new(arena, 1));
+                    sides.0.add(thread).write(Parsed { dedups: Scatter::new(arena, 1), events, clicks });
+                    barrier.wait();
+                    let side = std::slice::from_raw_parts(sides.0 as *const Parsed, threads);
+                    let (parts, side_threads) = parts.get_or_init(|| {
+                        let mut parts: Vec<(usize, usize)> = (0..side_parts)
+                            .map(|part| (side.iter().map(|thread| thread.events.len(part)).sum::<usize>(), part))
+                            .filter(|part| part.0 > 0)
+                            .collect();
+                        parts.sort_unstable_by_key(|&part| std::cmp::Reverse(part));
+                        let events: usize = parts.iter().map(|part| part.0).sum();
+                        (parts, (events / 40_000 + 1).min(threads))
+                    });
+                    let mut worker = (thread == 0).then(|| Worker::new(context, output, thread));
+                    loop {
+                        let job = jobs.get(next_job.load(Relaxed));
+                        let part = if thread < *side_threads { parts.get(next_part.load(Relaxed)) } else { None };
+                        match (job, part) {
+                            (None, None) => break,
+                            (Some(job), part) if part.is_none_or(|part| job.events >= part.0) => {
+                                let at = next_job.fetch_add(1, Relaxed);
+                                let Some(job) = jobs.get(at) else { continue };
+                                let name = names[at].load(Relaxed);
+                                if name != NONE {
+                                    local.job_sessions(job, edges, name, odd_users);
+                                }
+                            }
+                            _ => {
+                                let Some(&(_, part)) = parts.get(next_part.fetch_add(1, Relaxed)) else { continue };
+                                worker.get_or_insert_with(|| Worker::new(context, output, thread)).partition(side, part);
+                            }
+                        }
+                    }
+                    local.write_file();
                     for (cell, tally) in local.tallies.iter_mut().enumerate() {
                         tally.assisted += local.assisted[cell];
                         tally.sessions += local.credited[cell];
                         tally.purchasing += local.bought[cell][0] as u32;
                         tally.revenue += local.bought[cell][1];
                     }
-                    (local.tallies, Sendable(side))
+                    let more = worker.map(|mut worker| {
+                        worker.write_file();
+                        worker.tallies
+                    });
+                    (local.tallies, more)
                 })
             }
         }
@@ -2058,32 +2380,7 @@ pub fn run(data: &Path, output: &Path, threads: usize, verbose: bool, started: I
         remove_output(output);
         return refuse("a user's events were not together");
     }
-
-    let (mut tallies, side): (Vec<Vec<Tally>>, Vec<Parsed>) = results.into_iter().map(|(tally, side)| (tally, side.0)).unzip();
-    let side = &side;
-    let side_events: usize = side.iter().map(|thread| (0..side_parts).map(|part| thread.events.len(part)).sum::<usize>()).sum();
-    let side_threads = (side_events / 200_000 + 1).min(threads);
-    let next = AtomicUsize::new(0);
-    let more: Vec<Vec<Tally>> = {
-        {
-            {
-                let next = &next;
-                pool::map(side_threads, move |thread| {
-                    let mut worker = Worker::new(context, output, thread);
-                    loop {
-                        let part = next.fetch_add(1, Relaxed);
-                        if part >= side_parts {
-                            break;
-                        }
-                        unsafe { worker.partition(side, part) };
-                    }
-                    worker.write_file();
-                    worker.tallies
-                })
-            }
-        }
-    };
-    tallies.extend(more);
+    let tallies: Vec<Vec<Tally>> = results.into_iter().flat_map(|(tally, more)| std::iter::once(tally).chain(more)).collect();
     lap("dense: side path");
 
     let mut columns: Vec<Column> = (0..7).map(|_| Column::default()).collect();

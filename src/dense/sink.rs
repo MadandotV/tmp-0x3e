@@ -71,7 +71,7 @@ impl Frame {
         let left = _mm256_or_si256(_mm256_andnot_si256(fits, all(u64::MAX)), foreign);
 
         let stamp = _mm256_blendv_epi8(all(INVALID << 32), _mm256_slli_epi64::<32>(stamp), valid);
-        let a = _mm256_or_si256(_mm256_or_si256(_mm256_and_si256(dense, valid), stamp), _mm256_and_si256(_mm256_slli_epi64::<49>(index), all(1 << 63)));
+        let a = _mm256_or_si256(_mm256_or_si256(_mm256_and_si256(dense, valid), stamp), _mm256_and_si256(_mm256_slli_epi64::<49>(index), all(if BUCKET_BITS > 14 { 1 << 63 } else { 0 })));
         let b = _mm256_or_si256(_mm256_slli_epi64::<29>(_mm256_sub_epi64(seconds, all(u64::MAX))), _mm256_slli_epi64::<50>(index));
         _mm256_storeu_si256(records as *mut __m256i, _mm256_unpacklo_epi64(a, b));
         _mm256_storeu_si256(records.add(2) as *mut __m256i, _mm256_unpackhi_epi64(a, b));
